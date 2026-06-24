@@ -131,6 +131,10 @@ class PipelineEngine:
         """Get highest-engagement genomes."""
         return [g.to_dict() for g in self._repo.get_top_genomes(limit=limit)]
 
+    def refresh_scorer(self, new_scorer: ICompositeScorer) -> None:
+        """Hot-swap the scorer (called after weight training)."""
+        self._scorer = new_scorer
+
     def get_stats(self) -> dict:
         """Get pipeline statistics."""
         return self._repo.get_stats()

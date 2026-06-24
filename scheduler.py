@@ -66,7 +66,7 @@ class IngestionScheduler:
         # After ingestion completes, auto-run the viral content pipeline
         if job_type == "full":
             try:
-                from services.pipeline import pipeline_engine
+                from services.pipeline import pipeline_engine, auto_train_and_refresh
                 from database import get_outliers
 
                 outliers = get_outliers(platform=None, hours=24, limit=10)
@@ -77,6 +77,11 @@ class IngestionScheduler:
                     )
                     print(f"[Scheduler] Pipeline: {result['genomes_extracted']} genomes, "
                           f"{result['opportunities_created']} opportunities")
+                    
+                    # Auto-train weights from accumulated feedback
+                    train_result = auto_train_and_refresh()
+                    if train_result["status"] == "trained":
+                        print(f"[Scheduler] Weights retrained: {train_result['active_weights']}")
             except Exception as e:
                 print(f"[Scheduler] Pipeline post-process failed: {e}")
 

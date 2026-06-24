@@ -71,5 +71,12 @@ async def train_weights():
     """
     Retrain scorer weights based on performance feedback.
     Requires minimum 10 data points with performance metrics.
+    Auto-refreshes the pipeline scorer with new weights.
     """
-    return feedback_service.train_weights()
+    result = feedback_service.train_weights()
+    if result["status"] == "trained":
+        from services.pipeline import refresh_scorer_from_feedback
+        refresh = refresh_scorer_from_feedback()
+        result["scorer_refreshed"] = True
+        result["active_weights"] = refresh.get("weights")
+    return result

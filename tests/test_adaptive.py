@@ -495,3 +495,134 @@ class TestAdaptivePipeline:
         
         # Engagement weight should be higher than structure
         assert result["new_weights"]["engagement"] > result["new_weights"]["structure"]
+
+
+# ─── Closed Loop Tests ─────────────────────────────────────────────────────
+
+class TestClosedLoop:
+    """Tests for the full closed loop: train → refresh → score with new weights."""
+
+    def test_refresh_scorer_updates_weights(self, monkeypatch, tmp_path):
+        """After training, refresh_scorer_from_feedback updates the pipeline scorer."""
+        import sqlite3
+        db_path = tmp_path / "refresh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        monkeypatch.setattr("services.feedback.get_connection", lambda: conn)
+        FeedbackService._instance = None
+        svc = FeedbackService()
+
+        # Create 12 data points to enable training
+        for i in range(12):
+            breakdown = json.dumps({
+                "engagement": {"raw": 30 + i * 5, "weight": 0.35},
+                "structure": {"raw": 70, "weight": 0.40},
+                "voice_match": {"raw": 50, "weight": 0.25},
+            })
+            pub = svc.mark_published(i, f"g{i}", "post", 50.0, breakdown)
+            svc.record_performance(pub["id"], impressions=2000, engagements=100 + i * 10)
+
+        # Train
+        train_result = svc.train_weights()
+        assert train_result["status"] == "trained"
+
+        # Now test refresh
+        from services.pipeline import refresh_scorer_from_feedback
+        refresh_result = refresh_scorer_from_feedback()
+        assert refresh_result["status"] == "refreshed"
+        assert "weights" in refresh_result
+
+    def test_auto_train_and_refresh(self, monkeypatch, tmp_path):
+        """auto_train_and_refresh trains + applies weights in one call."""
+        import sqlite3
+        db_path = tmp_path / "auto.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        monkeypatch.setattr("services.feedback.get_connection", lambda: conn)
+        FeedbackService._instance = None
+        svc = FeedbackService()
+
+        # Seed enough data
+        for i in range(15):
+            breakdown = json.dumps({
+                "engagement": {"raw": 40 + i * 3, "weight": 0.35},
+                "structure": {"raw": 60, "weight": 0.40},
+            })
+            pub = svc.mark_published(i, f"g{i}", "post", 50.0, breakdown)
+            svc.record_performance(pub["id"], impressions=3000, engagements=150 + i * 8)
+
+        from services.pipeline import auto_train_and_refresh
+        result = auto_train_and_refresh()
+        assert result["status"] == "trained"
+        assert result.get("scorer_refreshed") is True
+        assert "active_weights" in result
+
+    def test_auto_train_insufficient_data(self):
+        """auto_train_and_refresh returns insufficient_data when too few records."""
+        from services.pipeline import auto_train_and_refresh
+        result = auto_train_and_refresh()
+        assert result["status"] in ("insufficient_data", "no_correlations")
+
+    def test_refresh_without_weights(self, monkeypatch, tmp_path):
+        """refresh returns no_weights when nothing has been trained."""
+        import sqlite3
+        db_path = tmp_path / "empty.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        monkeypatch.setattr("services.feedback.get_connection", lambda: conn)
+        FeedbackService._instance = None
+        FeedbackService()  # Init tables
+
+        from services.pipeline import refresh_scorer_from_feedback
+        result = refresh_scorer_from_feedback()
+        assert result["status"] == "no_weights"
+
+    def test_pipeline_engine_refresh_scorer(self, sample_genome):
+        """PipelineEngine.refresh_scorer hot-swaps the scorer."""
+        from services.pipeline.scoring import CompositeScorer, EngagementScorer, StructureScorer
+        from services.pipeline.orchestrator import PipelineEngine
+        from services.pipeline.genome import LLMGenomeExtractor
+        from services.pipeline.repository import GenomeRepository
+        from services.pipeline.generator import LLMVariantGenerator
+
+        # Create engine with default weights
+        scorer_v1 = CompositeScorer([
+            EngagementScorer(weight=0.5),
+            StructureScorer(weight=0.5),
+        ])
+        engine = PipelineEngine(
+            extractor=LLMGenomeExtractor(),
+            repository=GenomeRepository(),
+            scorer=scorer_v1,
+            generator=LLMVariantGenerator(),
+        )
+
+        variant = ContentVariant(
+            genome_id="test", variant_type="post",
+            title="Test", content="Test content with some words", hook="Hook"
+        )
+        score_v1, breakdown_v1 = engine._scorer.score(variant, sample_genome)
+
+        # Now refresh with heavily skewed weights
+        scorer_v2 = CompositeScorer([
+            EngagementScorer(weight=0.95),
+            StructureScorer(weight=0.05),
+        ])
+        engine.refresh_scorer(scorer_v2)
+
+        score_v2, breakdown_v2 = engine._scorer.score(variant, sample_genome)
+
+        # Breakdown weights should now reflect v2
+        assert breakdown_v2["engagement"]["weight"] == 0.95
+        assert breakdown_v2["structure"]["weight"] == 0.05
+
+        # Scores should differ (different weight emphasis)
+        # v1: 50/50, v2: 95/5 — engagement-heavy scoring
+        if score_v1 != score_v2:
+            assert abs(score_v1 - score_v2) > 0.1  # Meaningful difference

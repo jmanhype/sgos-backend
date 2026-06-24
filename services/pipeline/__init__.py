@@ -70,4 +70,51 @@ def _default_scorers() -> list:
 
 pipeline_engine = create_pipeline_engine()
 
-__all__ = ["pipeline_engine", "create_pipeline_engine", "PipelineEngine"]
+
+def refresh_scorer_from_feedback() -> dict:
+    """
+    Rebuild the pipeline scorer with latest trained weights.
+    Called after training or on scheduler tick.
+    Returns training status dict.
+    """
+    trained = feedback_service.get_trained_weights()
+    if not trained:
+        return {"status": "no_weights", "message": "No trained weights yet"}
+    
+    scorers = []
+    if "engagement" in trained:
+        scorers.append(EngagementScorer(weight=trained["engagement"]))
+    if "structure" in trained:
+        scorers.append(StructureScorer(weight=trained["structure"]))
+    if "voice_match" in trained:
+        scorers.append(VoiceMatchScorer(weight=trained["voice_match"]))
+    
+    if not scorers:
+        return {"status": "no_weights"}
+    
+    new_scorer = CompositeScorer(scorers)
+    pipeline_engine.refresh_scorer(new_scorer)
+    
+    return {
+        "status": "refreshed",
+        "weights": trained,
+    }
+
+
+def auto_train_and_refresh() -> dict:
+    """
+    Attempt to train weights from feedback data and refresh the scorer.
+    Called by scheduler after pipeline runs.
+    """
+    result = feedback_service.train_weights()
+    if result["status"] == "trained":
+        refresh_result = refresh_scorer_from_feedback()
+        result["scorer_refreshed"] = True
+        result["active_weights"] = refresh_result.get("weights")
+    return result
+
+
+__all__ = [
+    "pipeline_engine", "create_pipeline_engine", "PipelineEngine",
+    "refresh_scorer_from_feedback", "auto_train_and_refresh",
+]
