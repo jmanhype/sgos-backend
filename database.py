@@ -132,7 +132,6 @@ def init_db():
         pass  # FTS table already exists
 
     conn.commit()
-    conn.close()
 
 
 def upsert_post(post: dict) -> str:
@@ -174,6 +173,20 @@ def upsert_post(post: dict) -> str:
         post.get("created_at", now), now
     ))
     conn.commit()
+
+    # Sync FTS5 index (external content mode requires manual sync)
+    try:
+        if existing:
+            # Delete old FTS entry, then re-insert
+            c.execute("DELETE FROM posts_fts WHERE rowid = (SELECT rowid FROM posts WHERE id = ?)", (post_id,))
+        c.execute("""
+            INSERT INTO posts_fts(rowid, title, content, subreddit, author)
+            SELECT rowid, title, content, subreddit, author FROM posts WHERE id = ?
+        """, (post_id,))
+        conn.commit()
+    except Exception:
+        pass  # FTS sync is best-effort — search degrades gracefully
+
     return "updated" if existing else "added"
 
 
@@ -205,7 +218,6 @@ def update_sub_stats(subreddit: str):
         """, (subreddit, mean, stddev, len(scores), now))
 
     conn.commit()
-    conn.close()
 
 
 def compute_z_scores(subreddit: str):
@@ -232,7 +244,6 @@ def compute_z_scores(subreddit: str):
             c.execute("UPDATE posts SET z_score=? WHERE id=?", (z, post["id"]))
 
     conn.commit()
-    conn.close()
 
 
 def get_outliers(platform: str = None, hours: int = 24, limit: int = 10) -> list[dict]:
@@ -256,7 +267,6 @@ def get_outliers(platform: str = None, hours: int = 24, limit: int = 10) -> list
             LIMIT ?
         """, (f"-{hours}", limit)).fetchall()
 
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -281,7 +291,6 @@ def get_trending_topics(platform: str = None, days: int = 7, limit: int = 10) ->
             LIMIT 500
         """, (f"-{days}",)).fetchall()
 
-    conn.close()
 
     # Simple keyword extraction (Phase 1 — will upgrade to proper NLP later)
     from collections import Counter
@@ -340,7 +349,6 @@ def get_stats() -> dict:
         WHERE z_score > 2.0 AND ingested_at >= datetime('now', '-24 hours')
     """).fetchone()["n"]
 
-    conn.close()
     return {
         "total_posts": total,
         "platforms": platforms,

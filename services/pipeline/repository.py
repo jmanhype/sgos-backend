@@ -251,6 +251,46 @@ class GenomeRepository:
             "hook_distribution": {r["hook_type"]: r["n"] for r in hook_types},
         }
 
+    def get_opportunity_by_id(self, opportunity_id: int) -> dict | None:
+        """Get a single opportunity by ID."""
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT * FROM pipeline_opportunities WHERE id = ?",
+            (opportunity_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_opportunities_for_genome(self, post_id: str, limit: int = 5) -> list[dict]:
+        """Get opportunities for a specific genome, sorted by score desc."""
+        conn = get_connection()
+        rows = conn.execute(
+            """SELECT o.* FROM pipeline_opportunities o
+               WHERE o.genome_id = ?
+               ORDER BY o.score DESC
+               LIMIT ?""",
+            (post_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def dismiss_all_unseen(self, below_score: float | None = None) -> int:
+        """Batch-dismiss all unseen opportunities in a single SQL statement."""
+        conn = get_connection()
+        if below_score is not None:
+            result = conn.execute(
+                """UPDATE pipeline_opportunities
+                   SET dismissed = 1
+                   WHERE viewed = 0 AND dismissed = 0 AND score < ?""",
+                (below_score,),
+            )
+        else:
+            result = conn.execute(
+                """UPDATE pipeline_opportunities
+                   SET dismissed = 1
+                   WHERE viewed = 0 AND dismissed = 0"""
+            )
+        conn.commit()
+        return result.rowcount
+
     def _row_to_genome(self, row) -> ViralGenome:
         """Convert a database row to a ViralGenome object."""
         return ViralGenome(

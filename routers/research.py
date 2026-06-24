@@ -2,7 +2,6 @@
 Thin router — all logic delegated to ResearchService."""
 from fastapi import APIRouter, Query
 
-from config import settings
 from services.research import research_service
 
 router = APIRouter(tags=["research"])

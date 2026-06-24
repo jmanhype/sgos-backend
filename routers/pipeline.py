@@ -24,9 +24,10 @@ async def run_pipeline(
     3. Generate variants
     4. Score & store opportunities
     """
-    from database import get_outliers
+    from services.research import research_service
 
-    outliers = get_outliers(platform=platform, hours=hours, limit=limit)
+    result = research_service.get_outliers(platform=platform, hours=hours, limit=limit)
+    outliers = result.get("outliers", [])
     if not outliers:
         return {"message": "No outliers found", "hours": hours, "platform": platform}
 
@@ -124,9 +125,8 @@ async def format_opportunity(
     """
     from services.pipeline.formatters import format_opportunity as fmt_opp
 
-    # Get the opportunity
-    opps = pipeline_engine.get_opportunities(limit=200, unseen_only=False)
-    opp = next((o for o in opps if o["id"] == opportunity_id), None)
+    # Get the opportunity directly by ID
+    opp = pipeline_engine.get_opportunity_by_id(opportunity_id)
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
 
@@ -144,10 +144,9 @@ async def format_opportunity(
 @router.get("/opportunities/{opportunity_id}/format/all")
 async def format_all_platforms(opportunity_id: int):
     """Format an opportunity for ALL supported platforms at once."""
-    from services.pipeline.formatters import format_opportunity as fmt_opp, FORMATTERS
+    from services.pipeline.formatters import format_opportunity as fmt_opp
 
-    opps = pipeline_engine.get_opportunities(limit=200, unseen_only=False)
-    opp = next((o for o in opps if o["id"] == opportunity_id), None)
+    opp = pipeline_engine.get_opportunity_by_id(opportunity_id)
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
 
@@ -172,15 +171,7 @@ async def dismiss_all_unseen(
     below_score: float = Query(None, description="Only dismiss opportunities below this score"),
 ):
     """Dismiss all unseen opportunities (optionally filtered by score)."""
-    opps = pipeline_engine.get_opportunities(limit=500, unseen_only=True)
-
-    dismissed = 0
-    for opp in opps:
-        if below_score is not None and opp.get("score", 0) >= below_score:
-            continue
-        pipeline_engine.dismiss(opp["id"])
-        dismissed += 1
-
+    dismissed = pipeline_engine.dismiss_all_unseen(below_score=below_score)
     return {"status": "ok", "dismissed": dismissed, "below_score": below_score}
 
 
@@ -192,10 +183,20 @@ async def regenerate_batch(
     num_variants: int = Query(3, ge=1, le=5),
 ):
     """Re-generate variants for top-performing genomes."""
-    genomes = pipeline_engine.get_top_genomes(limit=limit)
+    # Get genomes filtered by opportunities with min_score
+    genomes = pipeline_engine.get_top_genomes(limit=limit * 2)
+
+    # Filter to only genomes whose best opportunity meets min_score
+    filtered_genomes = []
+    for genome in genomes:
+        if len(filtered_genomes) >= limit:
+            break
+        opps = pipeline_engine.get_opportunities_for_genome(genome["post_id"], limit=1)
+        if opps and opps[0].get("score", 0) >= min_score:
+            filtered_genomes.append(genome)
 
     results = []
-    for genome in genomes:
+    for genome in filtered_genomes:
         result = pipeline_engine.regenerate_for_genome(
             post_id=genome["post_id"],
             voice_prompt=voice_prompt,

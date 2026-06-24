@@ -16,7 +16,9 @@ class CreatorsService:
 
     @staticmethod
     def unfollow(handle: str, platform: str = "twitter") -> dict:
-        remove_creator(handle, platform)
+        removed = remove_creator(handle, platform)
+        if not removed:
+            return {"status": "not_found", "handle": handle, "platform": platform}
         return {"status": "unfollowed", "handle": handle}
 
     @staticmethod
@@ -39,8 +41,10 @@ class CreatorsService:
         limit: int = 10,
     ) -> dict:
         """Auto-discover high-performing creators not already tracked."""
-        conn = get_connection()
+        # Get tracked handles before opening our own query (list_creators manages its own conn)
         tracked = [c["handle"] for c in list_creators()]
+
+        conn = get_connection()
 
         query = """
             SELECT author, platform, subreddit,
@@ -50,19 +54,22 @@ class CreatorsService:
                    AVG(COALESCE(comment_count, 0)) as avg_comments
             FROM posts
             WHERE author IS NOT NULL AND author != ''
+        """
+        params: list = []
+
+        if platform:
+            query += " AND platform = ?"
+            params.append(platform)
+
+        query += """
             GROUP BY author, platform
             HAVING post_count >= 3 AND avg_score >= ?
             ORDER BY avg_score DESC
             LIMIT ?
         """
-        params: list = [min_score, limit * 3]
-
-        if platform:
-            query = query.replace("FROM posts", "FROM posts WHERE platform = ?")
-            params.insert(0, platform)
+        params.extend([min_score, limit * 3])
 
         rows = conn.execute(query, params).fetchall()
-        conn.close()
 
         discovered = []
         for row in rows:

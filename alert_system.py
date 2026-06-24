@@ -5,11 +5,12 @@ Uses Hermes gateway or direct Telegram Bot API.
 """
 import json
 import os
+import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "sgos.db"
+DB_PATH = os.environ.get("SGOS_DB_PATH", str(Path(__file__).parent / "sgos.db"))
 
 
 def get_alert_config() -> dict:
@@ -220,8 +221,17 @@ def _is_in_cooldown(post: dict, cooldown_hours: int) -> bool:
 
 def _record_alert_sent(message: str):
     """Mark that an alert was sent (for cooldown tracking)."""
-    # Already recorded by _save_local_alert with sent=1
-    pass
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("CREATE TABLE IF NOT EXISTS alert_log (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT, sent INTEGER DEFAULT 0, created_at TEXT)")
+        conn.execute(
+            "INSERT INTO alert_log (message, sent, created_at) VALUES (?, 1, ?)",
+            (message[:500], datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def check_and_alert_outliers(threshold: float = 3.0, limit: int = 5, hours: int = 24) -> dict:

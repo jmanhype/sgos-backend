@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     if settings.api_key:
         log.info("auth.enabled")
     else:
-        log.warn("auth.disabled", hint="Set SGOS_API_KEY for production")
+        log.warning("auth.disabled", hint="Set SGOS_API_KEY for production")
         log.error("auth.production_risk", detail="Server has NO authentication — any network-accessible deployment is fully open")
 
     # Start background ingestion scheduler
@@ -125,7 +125,7 @@ async def request_tracing(request: Request, call_next):
             duration_ms=duration_ms,
         )
         if duration_ms > 5000:
-            log.warn("request.slow",
+            log.warning("request.slow",
                      method=request.method, path=request.url.path,
                      status=response.status_code, duration_ms=round(duration_ms, 1))
 

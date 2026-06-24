@@ -1,7 +1,6 @@
 """Content service — repurposing, idea generation, scoring."""
 import json
 
-from database import get_connection
 from repositories.posts import posts_repo
 
 
@@ -53,6 +52,8 @@ Write each piece as if it's going live TODAY."""
 
         from idea_generation import _get_client
         client, model = _get_client()
+        if client is None:
+            return {"error": "LLM not configured. Set SGOS_LLM_API_KEY and SGOS_LLM_BASE_URL."}
 
         prompt = f"""Score this post's content quality on 5 dimensions (1-10 scale each).
 

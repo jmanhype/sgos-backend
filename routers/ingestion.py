@@ -4,11 +4,10 @@ import threading
 
 from fastapi import APIRouter, Query
 
-from config import settings
 from database import upsert_post
 from reddit_ingest import ingest_all, TARGET_SUBREDDITS
 from topic_ingest import ingest_topics, ingest_custom_queries, TOPIC_QUERIES
-from services.ingestion import ingestion_service, ingestion_progress
+from services.ingestion import ingestion_service
 
 router = APIRouter(tags=["ingestion"])
 

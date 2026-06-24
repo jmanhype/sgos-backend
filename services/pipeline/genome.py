@@ -21,7 +21,7 @@ class LLMGenomeExtractor:
 
     HOOK_TYPES = [
         "question", "statistic", "story", "contrarian", "list",
-        "bold_claim", "tutorial", "meme", "personal", "news",
+        "bold_claim", "tutorial", "meme", "personal", "news", "announcement",
     ]
 
     STRUCTURAL_PATTERNS = [

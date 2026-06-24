@@ -108,7 +108,7 @@ class VoiceMatchScorer:
         # Term frequency (log-normalized)
         counts = Counter(tokens)
         total = len(tokens)
-        tf = {word: (1 + math.log(count / total)) for word, count in counts.items() if count > 0}
+        tf = {word: (1 + math.log(count)) for word, count in counts.items() if count > 0}
         
         return tf
 

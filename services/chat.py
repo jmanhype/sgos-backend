@@ -1,6 +1,5 @@
 """Chat service — LLM streaming, prompt building, system personality."""
 import json
-from database import get_connection
 
 
 class ChatService:
@@ -59,6 +58,9 @@ Your strengths:
         """Generate SSE events from LLM streaming response."""
         from idea_generation import _get_client
         client, model = _get_client()
+        if client is None:
+            yield {"data": json.dumps({"error": "LLM not configured. Set SGOS_LLM_API_KEY.", "done": True})}
+            return
 
         full_messages = [{"role": "system", "content": system_prompt}]
         for msg in messages:

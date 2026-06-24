@@ -140,6 +140,18 @@ class PipelineEngine:
         """Get pipeline statistics."""
         return self._repo.get_stats()
 
+    def get_opportunity_by_id(self, opportunity_id: int) -> dict | None:
+        """Get a single opportunity by ID."""
+        return self._repo.get_opportunity_by_id(opportunity_id)
+
+    def get_opportunities_for_genome(self, post_id: str, limit: int = 5) -> list[dict]:
+        """Get opportunities for a specific genome."""
+        return self._repo.get_opportunities_for_genome(post_id, limit=limit)
+
+    def dismiss_all_unseen(self, below_score: float | None = None) -> int:
+        """Dismiss all unseen opportunities in a single batch SQL operation."""
+        return self._repo.dismiss_all_unseen(below_score=below_score)
+
     def regenerate_for_genome(
         self,
         post_id: str,
