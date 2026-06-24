@@ -97,8 +97,9 @@ class PipelineEngine:
                     score, breakdown = self._scorer.score(variant, genome)
                     variant.score = score
                     variant.score_breakdown = breakdown
-                    self._repo.save_opportunity(variant)
-                    results["opportunities_created"] += 1
+                    opp_id = self._repo.save_opportunity(variant)
+                    if opp_id != -1:  # -1 = duplicate, skipped
+                        results["opportunities_created"] += 1
 
                 results["variants_generated"] += len(variants)
 
@@ -161,8 +162,9 @@ class PipelineEngine:
             score, breakdown = self._scorer.score(variant, genome)
             variant.score = score
             variant.score_breakdown = breakdown
-            self._repo.save_opportunity(variant)
-            created += 1
+            opp_id = self._repo.save_opportunity(variant)
+            if opp_id != -1:
+                created += 1
 
         return {
             "genome_id": post_id,

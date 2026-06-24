@@ -399,6 +399,13 @@ class TestGenomeRepository:
 
 class TestPipelineEngine:
     def setup_method(self):
+        # Clean pipeline tables to avoid content_hash dedup collisions
+        from database import get_connection
+        conn = get_connection()
+        conn.execute("DELETE FROM pipeline_opportunities")
+        conn.execute("DELETE FROM viral_genomes")
+        conn.commit()
+
         self.engine = PipelineEngine(
             extractor=LLMGenomeExtractor(),
             repository=GenomeRepository(),
@@ -478,6 +485,11 @@ class TestPipelineEngine:
             num_variants=1,
             skip_existing=False,
         )
+        # Clear opportunities so regeneration doesn't hit content_hash dedup
+        from database import get_connection
+        get_connection().execute("DELETE FROM pipeline_opportunities")
+        get_connection().commit()
+
         result = self.engine.regenerate_for_genome(
             post_id=SAMPLE_POST["id"],
             num_variants=2,
