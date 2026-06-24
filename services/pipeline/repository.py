@@ -6,7 +6,6 @@ SOLID:
   - Dependency Inversion: Implements IGenomeRepository protocol.
 """
 import json
-import sqlite3
 from datetime import datetime, timezone
 
 from database import get_connection

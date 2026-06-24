@@ -251,9 +251,9 @@ class TestPipelineAlerts:
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        # Create the opportunities table (minimal)
+        # Create the pipeline_opportunities table (matches repository.py)
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS opportunities (
+            CREATE TABLE IF NOT EXISTS pipeline_opportunities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 genome_id TEXT, variant_type TEXT, title TEXT, content TEXT,
                 hook TEXT, score REAL, score_breakdown TEXT,
@@ -282,7 +282,7 @@ class TestPipelineAlerts:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS opportunities (
+            CREATE TABLE IF NOT EXISTS pipeline_opportunities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 genome_id TEXT, variant_type TEXT, title TEXT, content TEXT,
                 hook TEXT, score REAL, score_breakdown TEXT,
@@ -296,9 +296,9 @@ class TestPipelineAlerts:
                 variant_type TEXT, alerted_at TEXT NOT NULL,
                 notified INTEGER DEFAULT 0, dismissed INTEGER DEFAULT 0
             );
-            INSERT INTO opportunities (genome_id, variant_type, title, content, hook, score, viewed, dismissed)
+            INSERT INTO pipeline_opportunities (genome_id, variant_type, title, content, hook, score, viewed, dismissed)
             VALUES ('g1', 'thread', 'Viral Post', 'Content here', 'Great hook', 85.0, 0, 0);
-            INSERT INTO opportunities (genome_id, variant_type, title, content, hook, score, viewed, dismissed)
+            INSERT INTO pipeline_opportunities (genome_id, variant_type, title, content, hook, score, viewed, dismissed)
             VALUES ('g2', 'post', 'Low Score', 'Content', 'Hook', 40.0, 0, 0);
         """)
 
@@ -317,7 +317,7 @@ class TestPipelineAlerts:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS opportunities (
+            CREATE TABLE IF NOT EXISTS pipeline_opportunities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 genome_id TEXT, variant_type TEXT, title TEXT, content TEXT,
                 hook TEXT, score REAL, score_breakdown TEXT,
@@ -331,7 +331,7 @@ class TestPipelineAlerts:
                 variant_type TEXT, alerted_at TEXT NOT NULL,
                 notified INTEGER DEFAULT 0, dismissed INTEGER DEFAULT 0
             );
-            INSERT INTO opportunities (genome_id, variant_type, title, content, hook, score, viewed, dismissed)
+            INSERT INTO pipeline_opportunities (genome_id, variant_type, title, content, hook, score, viewed, dismissed)
             VALUES ('g1', 'thread', 'Hot Take', 'Viral content', 'Shocking hook', 90.0, 0, 0);
         """)
 

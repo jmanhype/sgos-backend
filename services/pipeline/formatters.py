@@ -12,7 +12,6 @@ SOLID:
   - Open/Closed: Add platforms by implementing format() — no changes to existing.
 """
 import re
-import textwrap
 from dataclasses import dataclass
 
 
@@ -201,11 +200,17 @@ class LinkedInFormatter(PlatformFormatter):
         # Remove thread numbering
         text = re.sub(r'^\d+/\d+\s*', '', text, flags=re.MULTILINE)
 
+        # Strip markdown that LinkedIn doesn't render (shows raw asterisks)
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # Bold
+        text = re.sub(r'\*(.*?)\*', r'\1', text)      # Italic
+        text = re.sub(r'__(.*?)__', r'\1', text)       # Bold underline
+        text = re.sub(r'`(.*?)`', r'\1', text)         # Inline code
+
         # Ensure professional formatting
         if title and not text.startswith(title):
             text = f"{title}\n\n{text}"
 
-        # Add hook as first line if strong enough
+        # Add hook as first line if not already present
         if hook and not text.startswith(hook):
             text = f"{hook}\n\n{text}"
 
@@ -262,6 +267,10 @@ class NewsletterFormatter(PlatformFormatter):
         parts.append(content.strip())
 
         text = "\n".join(parts)
+
+        # Enforce max_chars (trim at word boundary)
+        if len(text) > self.max_chars:
+            text = text[:self.max_chars - 3].rsplit(' ', 1)[0] + "..."
 
         return FormattedPost(
             platform="newsletter",

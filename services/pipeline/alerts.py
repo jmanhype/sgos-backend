@@ -42,15 +42,16 @@ def _init_alert_table():
 
 def get_pending_alerts(threshold: float = 75.0, limit: int = 10) -> list[dict]:
     """Get unseen high-scoring opportunities (not yet alerted on)."""
+    _init_alert_table()
     conn = get_connection()
     rows = conn.execute("""
-        SELECT o.id, o.score, o.title, o.hook, o.variant_type, o.genome_id, o.created_at
-        FROM opportunities o
-        WHERE o.score >= ? AND o.viewed = 0 AND o.dismissed = 0
-        AND o.id NOT IN (
+        SELECT po.id, po.score, po.title, po.hook, po.variant_type, po.genome_id, po.created_at
+        FROM pipeline_opportunities po
+        WHERE po.score >= ? AND po.viewed = 0 AND po.dismissed = 0
+        AND po.id NOT IN (
             SELECT opportunity_id FROM pipeline_alerts WHERE dismissed = 0
         )
-        ORDER BY o.score DESC
+        ORDER BY po.score DESC
         LIMIT ?
     """, (threshold, limit)).fetchall()
 
@@ -139,15 +140,15 @@ def get_alert_history(limit: int = 20) -> list[dict]:
 def _send_telegram_alert(opportunities: list[dict]) -> int:
     """
     Send a Telegram notification for high-scoring opportunities.
-    Uses the existing alert_system if Telegram is configured.
+    Uses the alert_system's Telegram sender directly (bypasses outlier threshold).
     Returns number of notifications sent.
     """
-    try:
-        from alert_system import send_outlier_alert
-    except ImportError:
+    if not opportunities:
         return 0
 
-    if not opportunities:
+    try:
+        from alert_system import get_alert_config, _send_telegram
+    except (ImportError, AttributeError):
         return 0
 
     # Build message
@@ -168,7 +169,10 @@ def _send_telegram_alert(opportunities: list[dict]) -> int:
     message = "\n".join(lines)
 
     try:
-        send_outlier_alert({"title": "Pipeline Alert", "message": message}, method="telegram")
-        return 1
+        config = get_alert_config()
+        if not config.get("enabled"):
+            return 0
+        result = _send_telegram(message, config)
+        return 1 if result.get("status") == "sent" else 0
     except Exception:
         return 0
