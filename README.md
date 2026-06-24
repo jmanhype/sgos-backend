@@ -1,42 +1,63 @@
 # SGOS Backend
 
-> StraughterG-OS Intelligence Backend — Research Engine, Trend Detection, Voice Profiles, Content Generation
+> StraughterG-OS Intelligence Backend — Autonomous Viral Content Pipeline, Research Engine, Adaptive Scoring
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue?style=flat-square)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-green?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-52%20passed-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-180%20passed-brightgreen?style=flat-square)
 
 ---
 
 ## What is this?
 
-A Python/FastAPI backend powering [StraughterG-OS](https://github.com/StraughterG/StraughterG-os) — a creator intelligence platform that detects viral outliers, generates content, and tracks trending creators.
+A Python/FastAPI backend powering [StraughterG-OS](https://github.com/jmanhype/StraughterG-os) — a creator intelligence platform that autonomously detects viral outliers, extracts their structural DNA, generates content variants, scores them, and learns from real-world performance to improve over time.
 
 ### Features
 
+- **Autonomous Viral Content Pipeline** — Detect → Extract → Generate → Score → Alert (runs every 4 hours)
+- **Adaptive Scoring** — Closed feedback loop: publish → measure → train → improve weights
+- **Platform Formatters** — One-click export to X threads, LinkedIn, Bluesky, Newsletters
 - **Viral Outlier Detection** — Z-score analysis across Reddit, Hacker News, Twitter
-- **Multi-Format Content Generation** — Twitter threads, LinkedIn posts, TikTok scripts, IG carousels, newsletters
-- **Voice Profiles** — Analyze author writing patterns, apply to generated content
+- **Multi-Format Content Generation** — Threads, posts, newsletters, scripts, carousels
+- **Voice Profiles** — TF-IDF cosine similarity matching for consistent writing style
+- **Smart Alerts** — Telegram notifications when high-scoring opportunities are generated
+- **Bulk Actions** — Dismiss all, regenerate batch, copy top N formatted
 - **SSE Streaming** — Real-time LLM token delivery for chat
 - **FTS5 + TF-IDF Search** — Hybrid keyword + semantic search with Reciprocal Rank Fusion
 - **Creator Tracking** — Follow high-performing authors, discover new ones
 - **Automated Ingestion** — Background scheduler pulls fresh data every 4 hours
-- **Content Scoring** — LLM-based virality analysis (hook strength, shareability, etc.)
 
 ### Architecture
 
 ```
 main.py (slim app factory, ~110 LOC)
-├── routers/ (12 domain routers — HTTP layer)
-├── services/ (7 business logic modules)
-├── repositories/ (typed DB access)
-├── models/ (Pydantic schemas)
+├── routers/ (13 domain routers — HTTP layer)
+├── services/ (10 business logic modules)
+│   └── pipeline/ (autonomous viral content pipeline)
+│       ├── protocols.py    — Interface contracts (SOLID)
+│       ├── genome.py       — Viral DNA extraction
+│       ├── generator.py    — Content variant generation
+│       ├── scoring.py      — Pluggable scoring strategies
+│       ├── voice_match.py  — TF-IDF voice similarity
+│       ├── repository.py   — SQLite storage
+│       ├── orchestrator.py — Pipeline coordination
+│       ├── formatters.py   — Platform-specific output (X, LinkedIn, Bluesky)
+│       └── alerts.py       — High-score notifications
 ├── config.py (pydantic-settings, SGOS_ env prefix)
 ├── observability.py (structlog + Prometheus metrics)
-└── scheduler.py (background ingestion cron)
+└── scheduler.py (background ingestion + auto-train cron)
 ```
 
 **Pattern:** Every router delegates to a service. Zero inline SQL in any router.
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture Guide](docs/ARCHITECTURE.md) | System overview, data flow, design patterns, DB schema |
+| [API Reference](docs/API_REFERENCE.md) | Every endpoint with parameters, examples, edge cases |
+| [Pipeline Deep Dive](docs/PIPELINE.md) | How the viral content pipeline works stage by stage |
+| [Development Guide](docs/DEVELOPMENT.md) | Setup, testing, adding scorers/formatters, conventions |
 
 ## Quick Start
 
@@ -65,6 +86,8 @@ Health check: `curl http://localhost:8420/health`
 
 | Domain | Endpoints | Description |
 |--------|-----------|-------------|
+| Pipeline | `/pipeline/run`, `/opportunities`, `/format`, `/bulk` | Autonomous viral content pipeline + platform export |
+| Feedback | `/feedback/published`, `/performance`, `/train`, `/stats` | Performance tracking + adaptive scorer training |
 | Research | `/outliers`, `/trends`, `/stats`, `/brief` | Viral outlier detection, trend analysis |
 | Search | `/search`, `/search/hybrid`, `/search/similar` | FTS5 + TF-IDF hybrid search |
 | Content | `/repurpose`, `/ideas`, `/carousel`, `/analytics/score` | Multi-format content generation |
@@ -108,12 +131,15 @@ Or use the root-level `docker-compose.yml` for the full stack (backend + fronten
 pytest tests/ -v
 
 # Run specific categories
+pytest tests/ -v -k "TestPipeline"       # Pipeline unit tests
+pytest tests/ -v -k "TestAdaptive"       # Feedback loop + closed-loop
+pytest tests/ -v -k "TestFormatter"      # Platform formatters + alerts
 pytest tests/ -v -k "TestPerformance"    # Load tests
 pytest tests/ -v -k "TestSecurity"       # Security tests
 pytest tests/ -v -k "TestEdgeCases"      # Edge cases
 ```
 
-52 tests covering: unit, integration, edge cases, error handling, performance, security.
+180 tests covering: unit, integration, adaptive scoring, closed-loop feedback, platform formatting, pipeline alerts, edge cases, error handling, performance, security, and SOLID compliance.
 
 ## Observability
 
