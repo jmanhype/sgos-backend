@@ -1,7 +1,8 @@
-"""Content generation endpoints — repurposing, ideas, carousels, scoring."""
+"""Content generation endpoints — repurposing, ideas, carousels, scoring.
+Thin router — business logic delegated to ContentService + domain modules."""
 from fastapi import APIRouter, HTTPException, Query
 
-from database import get_connection
+from services.content import content_service
 
 router = APIRouter(tags=["content"])
 
@@ -13,69 +14,11 @@ async def repurpose_outlier(
     post_id: str = Query(None),
     title: str = Query(None),
 ):
-    """
-    Generate a repurposing prompt from an outlier post.
-    Returns a multi-format content generation prompt ready for the chat engine.
-    """
-    conn = get_connection()
-
-    post = None
-    if post_id:
-        row = conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
-        if row:
-            post = dict(row)
-
-    if not post and title:
-        row = conn.execute(
-            "SELECT * FROM posts WHERE title LIKE ? ORDER BY z_score DESC LIMIT 1",
-            (f"%{title}%",),
-        ).fetchone()
-        if row:
-            post = dict(row)
-
-    conn.close()
-
+    """Generate a repurposing prompt from an outlier post."""
+    post = content_service.find_post(post_id=post_id, title=title)
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-
-    # Build the repurposing prompt
-    context = f"""ORIGINAL POST (viral outlier, z-score: {post['z_score']:.1f}):
-Title: {post['title']}
-Platform: {post['platform']}/{post['subreddit']}
-Score: {post['score']} upvotes, {post['comment_count']} comments
-URL: {post['url']}"""
-
-    if post.get("content") and len(post["content"]) > 10:
-        context += f"\nContent: {post['content'][:500]}"
-
-    repurpose_prompt = f"""{context}
-
----
-
-REPURPOSE this viral post into 5 content formats. For each format, write the FULL ready-to-publish content (not a description of what to write):
-
-## 1. \U0001f9f5 Twitter/X Thread (6-8 posts)
-Hook with the most shocking angle. One idea per tweet. Use em dashes. End with a CTA.
-
-## 2. \U0001f4bc LinkedIn Post (200-300 words)
-Professional angle. Lead with a contrarian take. Use line breaks for readability. End with a question.
-
-## 3. \U0001f4e7 Newsletter Section (400-500 words)
-Deep dive format. Context \u2192 Insight \u2192 Application. Include data points. Personal voice.
-
-## 4. \U0001f3ac TikTok/Reel Script (60 seconds)
-Hook in first 3 seconds. Pattern interrupt at 15s. 3 key points. CTA at end.
-
-## 5. \U0001f4f8 Instagram Carousel (8 slides)
-Slide 1: Hook title. Slides 2-7: One insight per slide with supporting text. Slide 8: CTA + handle.
-
-Write each piece as if it's going live TODAY. Bold voice, sharp insights, no fluff."""
-
-    return {
-        "post": post,
-        "prompt": repurpose_prompt,
-        "formats": ["twitter_thread", "linkedin_post", "newsletter", "tiktok_script", "ig_carousel"],
-    }
+    return content_service.build_repurpose_prompt(post)
 
 
 @router.post("/repurpose/ai")
@@ -85,34 +28,14 @@ async def repurpose_ai(
     voice: str = Query("straughterg", description="Voice profile name"),
     formats: str = Query(None, description="Comma-separated formats (default: all 5)"),
 ):
-    """
-    AI-powered multi-format repurposing: generates actual ready-to-publish content
-    for Twitter thread, LinkedIn, Newsletter, TikTok script, and IG carousel.
-    """
+    """AI-powered multi-format repurposing."""
     from repurpose_engine import repurpose_post
 
-    conn = get_connection()
-    post = None
-    if post_id:
-        row = conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
-        if row:
-            post = dict(row)
-    elif title:
-        row = conn.execute(
-            "SELECT * FROM posts WHERE title LIKE ? ORDER BY z_score DESC LIMIT 1",
-            (f"%{title}%",),
-        ).fetchone()
-        if row:
-            post = dict(row)
-    conn.close()
-
+    post = content_service.find_post(post_id=post_id, title=title)
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    fmt_list = None
-    if formats:
-        fmt_list = [f.strip() for f in formats.split(",")]
-
+    fmt_list = [f.strip() for f in formats.split(",")] if formats else None
     return repurpose_post(post, voice_name=voice, formats=fmt_list)
 
 
@@ -221,55 +144,8 @@ async def render_single_slide(
 
 @router.post("/analytics/score/{post_id}")
 async def score_post(post_id: str):
-    """
-    Score a post's content quality using LLM.
-    Returns scores for hook strength, value density, shareability.
-    """
-    import json as _json
-    from idea_generation import _get_client
-
-    conn = get_connection()
-    post = conn.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
-    conn.close()
-
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-
-    post_dict = dict(post)
-    client, model = _get_client()
-
-    prompt = f"""Score this post's content quality on 5 dimensions (1-10 scale each).
-
-Post: "{post_dict.get('title', '')}"
-Content: {post_dict.get('content', 'N/A')[:500]}
-Platform: {post_dict.get('platform')} | Score: {post_dict.get('score', 0)} | Comments: {post_dict.get('comment_count', 0)}
-
-Respond in JSON only:
-{{
-  "hook_strength": 8,
-  "value_density": 7,
-  "shareability": 9,
-  "originality": 6,
-  "emotional_impact": 8,
-  "overall": 7.6,
-  "one_liner": "Brief verdict on why this post works or doesn't"
-}}"""
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=400,
-        )
-        content = response.choices[0].message.content.strip()
-        if "```" in content:
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
-
-        scores = _json.loads(content)
-        return {"post_id": post_id, "title": post_dict.get("title"), "scores": scores}
-    except Exception as e:
-        return {"post_id": post_id, "error": str(e)}
+    """Score a post's content quality using LLM."""
+    result = content_service.score_post(post_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
