@@ -3,6 +3,7 @@ SGOS Backend — FastAPI Application
 Slim app factory: registers middleware and routers.
 All business logic lives in routers/ modules.
 """
+import hmac
 import time
 from contextlib import asynccontextmanager
 
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
         log.info("auth.enabled")
     else:
         log.warn("auth.disabled", hint="Set SGOS_API_KEY for production")
+        log.error("auth.production_risk", detail="Server has NO authentication — any network-accessible deployment is fully open")
 
     # Start background ingestion scheduler
     init_scheduler()
@@ -49,6 +51,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Graceful shutdown — stop scheduler
+    from scheduler import scheduler
+    scheduler.stop()
     log.info("sgos.shutdown")
 
 
@@ -71,17 +76,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. CSRF Origin validation
+# 1. CSRF protection — require Origin header for state-changing requests
 @app.middleware("http")
-async def csrf_origin_check(request: Request, call_next):
-    """Validate Origin header on state-changing requests (POST/PUT/DELETE/PATCH)."""
+async def csrf_middleware(request: Request, call_next):
+    """Reject cross-origin state-changing requests without valid Origin."""
     if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        if request.url.path in ("/health", "/metrics"):
+            return await call_next(request)
         origin = request.headers.get("origin")
+        if not origin:
+            # Fall back to Referer for form submissions
+            referer = request.headers.get("referer", "")
+            origin = referer.rstrip("/") if referer else ""
         if origin and origin not in set(settings.allowed_origins):
-            return JSONResponse(
-                status_code=403,
-                content={"detail": f"Origin {origin} not allowed"},
-            )
+            return JSONResponse(status_code=403, content={"error": "Cross-origin request blocked"})
     return await call_next(request)
 
 # 3. Bearer token auth
@@ -92,7 +100,10 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     if settings.api_key:
         auth_header = request.headers.get("authorization", "")
-        if not auth_header.startswith("Bearer ") or auth_header[7:] != settings.api_key:
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+        provided = auth_header[7:]
+        if not hmac.compare_digest(provided, settings.api_key):
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     return await call_next(request)
 

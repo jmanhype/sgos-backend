@@ -22,7 +22,9 @@ class PostRepository:
     def search_fts(query: str, platform: str | None = None, limit: int = 20) -> list[dict]:
         conn = get_connection()
         platform_where = ""
-        params: list = [query]
+        # Sanitize FTS5 query to prevent operator injection
+        safe_query = '"' + query.replace('"', '""') + '"'
+        params: list = [safe_query]
         if platform and platform != "all":
             platform_where = "AND p.platform = ?"
             params.append(platform)

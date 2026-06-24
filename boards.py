@@ -3,6 +3,7 @@ SGOS Backend - Boards / Swipe Files
 Save posts to curated collections for research and inspiration.
 """
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 from database import get_connection

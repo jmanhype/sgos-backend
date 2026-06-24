@@ -86,6 +86,10 @@ def _fts5_search(query: str, limit: int = 40, platform: str = None) -> list[dict
         platform_where = "AND p.platform = ?"
         params.append(platform)
 
+    # Sanitize FTS5 query to prevent operator injection
+    safe_query = '"' + query.replace('"', '""') + '"'
+    params = [safe_query] + params[1:] if platform and platform != "all" else [safe_query]
+
     try:
         rows = c.execute(f"""
             SELECT p.*, rank

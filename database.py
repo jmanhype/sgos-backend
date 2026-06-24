@@ -136,51 +136,45 @@ def init_db():
 
 
 def upsert_post(post: dict) -> str:
-    """Insert or update a post. Returns 'added' or 'updated'."""
+    """Insert or update a post atomically. Returns 'added' or 'updated'.
+    
+    Uses INSERT ... ON CONFLICT DO UPDATE to preserve row identity,
+    avoiding foreign key violations from INSERT OR REPLACE (which deletes first).
+    """
     conn = get_connection()
     c = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
-
+    
+    post_id = post.get("id", f"{post['platform']}_{post['platform_id']}")
+    
+    # Check existence for return value
     existing = c.execute(
-        "SELECT score FROM posts WHERE platform=? AND platform_id=?",
-        (post["platform"], post["platform_id"])
+        "SELECT 1 FROM posts WHERE id = ?", (post_id,)
     ).fetchone()
-
-    if existing:
-        c.execute("""
-            UPDATE posts SET
-                score=?, comment_count=?, upvote_ratio=?, z_score=?,
-                title=?, content=?, author=?, url=?
-            WHERE platform=? AND platform_id=?
-        """, (
-            post.get("score", 0), post.get("comment_count", 0),
-            post.get("upvote_ratio", 0), post.get("z_score", 0),
-            post.get("title", ""), post.get("content", ""),
-            post.get("author", ""), post.get("url", ""),
-            post["platform"], post["platform_id"]
-        ))
-        conn.commit()
-        conn.close()
-        return "updated"
-    else:
-        c.execute("""
-            INSERT INTO posts (id, platform, platform_id, subreddit, title, content,
-                             author, url, score, comment_count, upvote_ratio,
-                             z_score, created_at, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            post.get("id", f"{post['platform']}_{post['platform_id']}"),
-            post["platform"], post["platform_id"],
-            post.get("subreddit", ""),
-            post.get("title", ""), post.get("content", ""),
-            post.get("author", ""), post.get("url", ""),
-            post.get("score", 0), post.get("comment_count", 0),
-            post.get("upvote_ratio", 0), post.get("z_score", 0),
-            post.get("created_at", now), now
-        ))
-        conn.commit()
-        conn.close()
-        return "added"
+    
+    c.execute("""
+        INSERT INTO posts (id, platform, platform_id, subreddit, title, content,
+                         author, url, score, comment_count, upvote_ratio,
+                         z_score, created_at, ingested_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            score=excluded.score, comment_count=excluded.comment_count,
+            upvote_ratio=excluded.upvote_ratio, z_score=excluded.z_score,
+            title=excluded.title, content=excluded.content,
+            author=excluded.author, url=excluded.url,
+            ingested_at=excluded.ingested_at
+    """, (
+        post_id,
+        post["platform"], post["platform_id"],
+        post.get("subreddit", ""),
+        post.get("title", ""), post.get("content", ""),
+        post.get("author", ""), post.get("url", ""),
+        post.get("score", 0), post.get("comment_count", 0),
+        post.get("upvote_ratio", 0), post.get("z_score", 0),
+        post.get("created_at", now), now
+    ))
+    conn.commit()
+    return "updated" if existing else "added"
 
 
 def update_sub_stats(subreddit: str):

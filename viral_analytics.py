@@ -49,6 +49,8 @@ Respond in JSON format:
 JSON response only, no markdown."""
 
     client, model = _get_client()
+    if not client:
+        return {"error": "No LLM configured — set SGOS_LLM_API_KEY"}
     content = None
     try:
         response = client.chat.completions.create(

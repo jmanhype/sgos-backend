@@ -3,6 +3,7 @@ Instagram Carousel Generator — generates slide content + HTML/CSS slides.
 Creates 8-10 slide carousels from a topic, post, or idea.
 Outputs: structured slide content + renderable HTML for each slide.
 """
+import html
 import json
 import os
 import re
@@ -223,7 +224,7 @@ def render_slide_html(slide: dict, total_slides: int, handle: str = "@Straughter
         body_size = 24
         accent_html = '<div class="accent-line"></div>'
     
-    html = HTML_SLIDE_TEMPLATE.format(
+    html_output = HTML_SLIDE_TEMPLATE.format(
         bg_color=scheme["bg_color"],
         headline_color=scheme["headline_color"],
         body_color=scheme["body_color"],
@@ -233,13 +234,13 @@ def render_slide_html(slide: dict, total_slides: int, handle: str = "@Straughter
         body_size=body_size,
         slide_num=slide["number"],
         total=total_slides,
-        headline=slide.get("headline", ""),
-        body=slide.get("body", "").replace("\n", "<br>"),
-        handle=handle,
+        headline=html.escape(slide.get("headline", "")),
+        body=html.escape(slide.get("body", "")).replace("\n", "<br>"),
+        handle=html.escape(handle),
         accent_html=accent_html,
     )
     
-    return html
+    return html_output
 
 
 def generate_carousel(topic: str, slide_count: int = 8, handle: str = "@StraughterG",

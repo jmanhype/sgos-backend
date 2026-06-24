@@ -13,6 +13,14 @@ class IngestionProgress:
 
     def start(self, job_id: str, job_type: str) -> str:
         with self._lock:
+            # Prune old completed jobs to prevent unbounded memory growth
+            if len(self._jobs) > 100:
+                oldest = sorted(
+                    (k for k in self._jobs if self._jobs[k]["status"] in ("completed", "failed")),
+                    key=lambda k: self._jobs[k]["started_at"],
+                )
+                for k in oldest[:50]:
+                    del self._jobs[k]
             self._jobs[job_id] = {
                 "id": job_id,
                 "type": job_type,
@@ -68,7 +76,7 @@ class IngestionService:
     @staticmethod
     def run_ingest_async(job_type: str = "full") -> str:
         """Start an ingestion job in a background thread with progress tracking."""
-        job_id = f"ingest_{int(time.time())}"
+        job_id = f"ingest_{int(time.time())}_{threading.get_ident()}"
         ingestion_progress.start(job_id, job_type)
 
         def run():

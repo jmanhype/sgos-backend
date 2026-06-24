@@ -9,8 +9,12 @@ class SearchService:
         conn = get_connection()
         c = conn.cursor()
 
+        # Sanitize FTS5 query: wrap in quotes to prevent injection of
+        # FTS5 operators (NEAR, NOT, column:, wildcards)
+        safe_q = '"' + q.replace('"', '""') + '"'
+
         platform_where = ""
-        params: list = [q]
+        params: list = [safe_q]
         if platform and platform != "all":
             platform_where = "AND p.platform = ?"
             params.append(platform)
