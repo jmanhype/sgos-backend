@@ -61,6 +61,24 @@ class IngestionScheduler:
             job_id = ingestion_service.run_ingest_async(job_type)
         except Exception as e:
             print(f"[Scheduler] Job {job_type} failed: {e}")
+            return
+
+        # After ingestion completes, auto-run the viral content pipeline
+        if job_type == "full":
+            try:
+                from services.pipeline import pipeline_engine
+                from database import get_outliers
+
+                outliers = get_outliers(platform=None, hours=24, limit=10)
+                if outliers:
+                    result = pipeline_engine.process_outliers(
+                        outliers=outliers,
+                        skip_existing=True,
+                    )
+                    print(f"[Scheduler] Pipeline: {result['genomes_extracted']} genomes, "
+                          f"{result['opportunities_created']} opportunities")
+            except Exception as e:
+                print(f"[Scheduler] Pipeline post-process failed: {e}")
 
     def status(self) -> dict:
         """Get scheduler status."""
