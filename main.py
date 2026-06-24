@@ -26,6 +26,7 @@ from scheduler import init_scheduler
 from routers import research, search, ingestion, voice, creators
 from routers import alerts, boards, content, scrape, media, analytics, chat
 from routers import pipeline
+from routers import feedback
 
 
 @asynccontextmanager
@@ -167,6 +168,7 @@ app.include_router(media.router)
 app.include_router(analytics.router)
 app.include_router(chat.router)
 app.include_router(pipeline.router)
+app.include_router(feedback.router)
 
 
 if __name__ == "__main__":
