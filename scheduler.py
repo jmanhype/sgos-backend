@@ -68,6 +68,7 @@ class IngestionScheduler:
             try:
                 from services.pipeline import pipeline_engine, auto_train_and_refresh
                 from database import get_outliers
+                from services.pipeline.alerts import alert_high_score
 
                 outliers = get_outliers(platform=None, hours=24, limit=10)
                 if outliers:
@@ -78,6 +79,11 @@ class IngestionScheduler:
                     print(f"[Scheduler] Pipeline: {result['genomes_extracted']} genomes, "
                           f"{result['opportunities_created']} opportunities")
                     
+                    # Auto-check alerts for high-scoring opportunities
+                    alert_result = alert_high_score(threshold=75.0)
+                    if alert_result["status"] == "alerted":
+                        print(f"[Scheduler] Alerts: {alert_result['alerts_created']} created")
+
                     # Auto-train weights from accumulated feedback
                     train_result = auto_train_and_refresh()
                     if train_result["status"] == "trained":

@@ -130,12 +130,26 @@ Respond in JSON only:
             return "list"
         if re.search(r'\d+%|\d+x|\d+\s*(billion|million|thousand)', t):
             return "statistic"
-        if any(w in t for w in ["i built", "i made", "i created", "my journey", "how i"]):
+        # Story: personal experiences, first-person narratives
+        story_triggers = [
+            "i built", "i made", "i created", "my journey", "how i",
+            "i tried", "i was", "i said", "i turned", "i found",
+            "i posted", "i quit", "i spent", "i launched", "i learned",
+            "my wife", "my boss", "my friend", "my mom", "my dad",
+            "thanks to", "victory", "finally", "after years",
+            "what happened", "here's what", "this happened",
+            "my experience", "my story", "my take",
+        ]
+        if any(w in t for w in story_triggers):
             return "story"
-        if any(w in t for w in ["stop", "wrong", "actually", "wrong about", "lies about"]):
+        if any(w in t for w in ["stop", "wrong", "actually", "wrong about", "lies about", "no one tells you"]):
             return "contrarian"
-        if any(w in t for w in ["show", "launch", "introducing", "announcing"]):
+        if any(w in t for w in ["show", "launch", "introducing", "announcing", "show hn", "launch hn"]):
             return "announcement"
+        if any(w in t for w in ["tutorial", "guide", "how to", "step by step", "beginner"]):
+            return "tutorial"
+        if any(w in t for w in ["meme", "lol", "lmao", "😂", "💀", "bruh"]):
+            return "meme"
         return "bold_claim"
 
     def _detect_pattern(self, title: str, content: str) -> str:

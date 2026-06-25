@@ -605,3 +605,123 @@ class TestSOLIDCompliance:
         assert hasattr(scorer, "score")
         assert not hasattr(scorer, "extract")
         assert not hasattr(scorer, "save")
+
+
+# ─── Regression Tests (2026-06-25 E2E Audit) ────────────────────────────────
+
+class TestTemplateGeneratorRegression:
+    """Regression: template generator must produce actual content, not skeleton briefs."""
+
+    def _make_genome(self, hook="Why I Quit My Job", pattern="narrative"):
+        return ViralGenome(
+            post_id="test_reg_001",
+            hook_type="story",
+            hook_text=hook,
+            emotional_arc=["curiosity", "insight", "action"],
+            structural_pattern=pattern,
+            key_phrases=["quit my job", "build something new", "indie hacker"],
+            content_length_words=200,
+            platform_signals={"platform": "reddit"},
+            engagement_score=0.8,
+            raw_post={"id": "test_reg_001"},
+        )
+
+    def test_template_generates_real_content_not_briefs(self):
+        """Variants must contain actual content, not 'This is a content brief' scaffolding."""
+        gen = LLMVariantGenerator()
+        genome = self._make_genome()
+        variants = gen.generate(genome, num_variants=3)
+
+        assert len(variants) == 3
+        for v in variants:
+            # Must NOT contain the old scaffolding text
+            assert "This is a content brief" not in v.content, \
+                f"Variant {v.variant_type} still has skeleton scaffolding"
+            assert "**Key angles to explore:**" not in v.content, \
+                f"Variant {v.variant_type} still has skeleton format"
+            # Must contain the hook
+            assert "Quit My Job" in v.content or "quit my job" in v.content.lower()
+
+    def test_thread_has_numbered_tweets(self):
+        """Thread variant must have numbered tweets."""
+        gen = LLMVariantGenerator()
+        genome = self._make_genome()
+        variants = gen.generate(genome, num_variants=3)
+
+        thread = next(v for v in variants if v.variant_type == "thread")
+        assert "1/" in thread.content
+        assert "🧵" in thread.content
+
+    def test_script_has_section_markers(self):
+        """Script variant must have [HOOK], [SETUP], [CLOSE] markers."""
+        gen = LLMVariantGenerator()
+        genome = self._make_genome()
+        variants = gen._template_generate(genome, "", num_variants=5)
+
+        script = next(v for v in variants if v.variant_type == "script")
+        assert "[HOOK" in script.content
+        assert "[SETUP" in script.content
+        assert "[CLOSE" in script.content
+
+    def test_carousel_has_slides(self):
+        """Carousel variant must have numbered slides."""
+        gen = LLMVariantGenerator()
+        genome = self._make_genome()
+        variants = gen._template_generate(genome, "", num_variants=5)
+
+        carousel = next(v for v in variants if v.variant_type == "carousel")
+        assert "Slide 1" in carousel.content
+        assert "SUMMARY" in carousel.content
+
+
+class TestHookDetectionRegression:
+    """Regression: hook detection must classify beyond just 'bold_claim'."""
+
+    def setup_method(self):
+        self.extractor = LLMGenomeExtractor()
+
+    def test_story_detection(self):
+        """Personal narrative titles should detect as 'story', not 'bold_claim'."""
+        story_titles = [
+            "I built a local LLM for my wife's tax work",
+            "I tried the exact replica prompt 101 times",
+            "I was on that flight — here's what happened",
+            "Thanks to AI, I restored a photo of my late uncle",
+            "I quit my job to build a SaaS",
+            "Victory: my wife finally recognized my hobby",
+        ]
+        for title in story_titles:
+            post = {"id": f"test_{title[:10]}", "title": title, "content": "", "score": 100, "comment_count": 10}
+            genome = self.extractor._rule_based_extract(post)
+            assert genome.hook_type == "story", \
+                f"Title '{title}' should be 'story' but got '{genome.hook_type}'"
+
+    def test_question_detection(self):
+        """Titles ending in ? should be 'question'."""
+        post = {"id": "test_q", "title": "Is Grok openly rebelling?", "content": "", "score": 100, "comment_count": 10}
+        genome = self.extractor._rule_based_extract(post)
+        assert genome.hook_type == "question"
+
+    def test_list_detection(self):
+        """Titles with 'N ways/tips/things' should be 'list'."""
+        post = {"id": "test_l", "title": "7 Ways to Make Your AI Sound Human", "content": "", "score": 100, "comment_count": 10}
+        genome = self.extractor._rule_based_extract(post)
+        assert genome.hook_type == "list"
+
+    def test_statistic_detection(self):
+        """Titles with percentages/multipliers should be 'statistic'."""
+        post = {"id": "test_s", "title": "This prompt increased my output by 300%", "content": "", "score": 100, "comment_count": 10}
+        genome = self.extractor._rule_based_extract(post)
+        assert genome.hook_type == "statistic"
+
+    def test_contrarian_detection(self):
+        """Titles with contrarian keywords should detect correctly."""
+        post = {"id": "test_c", "title": "Everyone is wrong about prompt engineering", "content": "", "score": 100, "comment_count": 10}
+        genome = self.extractor._rule_based_extract(post)
+        assert genome.hook_type == "contrarian"
+
+    def test_tutorial_detection(self):
+        """Tutorial keywords should detect as 'tutorial'."""
+        post = {"id": "test_t", "title": "A beginner's guide to fine-tuning LoRAs", "content": "", "score": 100, "comment_count": 10}
+        genome = self.extractor._rule_based_extract(post)
+        assert genome.hook_type == "tutorial"
