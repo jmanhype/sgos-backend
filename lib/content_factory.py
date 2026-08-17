@@ -489,7 +489,7 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
 
     # 1) Submit via the bridge.
     try:
-        async with httpx.AsyncClient(timeout=60, headers=api_headers) as client:
+        async with httpx.AsyncClient(timeout=120, headers=api_headers) as client:
             r = await client.post(
                 f"{H3_BRIDGE_URL}/v1/h3/submit", json={"job_json": wgp_job}
             )
@@ -588,9 +588,20 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path) -> Optional[str]:
         return None
     try:
         dest = out_dir / f"flux3_{int(time.time())}.mp4"
-        result = await asyncio.to_thread(_download, url, dest)
-        logger.info(f"_send_and_poll_flux: downloaded to {dest}")
-        return result
+        # Download via ego-bridge (host has fresh browser cookies for CDN auth)
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                f"{EGO_BRIDGE_URL}/v1/download",
+                json={"url": url, "output_path": str(dest)},
+            )
+            r.raise_for_status()
+            data = r.json()
+            size = data.get("size", 0)
+            if size < 1000:
+                logger.error(f"_send_and_poll_flux: downloaded file too small ({size}b), likely expired URL")
+                return None
+        logger.info(f"_send_and_poll_flux: downloaded to {dest} ({size} bytes)")
+        return str(dest)
     except Exception as exc:
         logger.error(f"_send_and_poll_flux: download failed: {exc}")
         return None
