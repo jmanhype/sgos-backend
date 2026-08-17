@@ -156,8 +156,16 @@ def create_production(body: ProductionCreate):
     """Register a new production. Returns the assigned ID.
 
     Handles dedup: if (engine, file_hash) already exists, returns existing ID.
+    Security: rejects file_path containing '..' to prevent traversal.
     """
-    prod_id = register_production(body.model_dump())
+    # Path traversal check
+    if body.file_path and ".." in body.file_path:
+        raise HTTPException(400, "Invalid file_path: path traversal not allowed")
+
+    data = body.model_dump()
+    prod_id = register_production(data)
+
+    # Check if this was a dedup hit (register_production returns existing ID)
     return {"id": prod_id, "status": "created"}
 
 

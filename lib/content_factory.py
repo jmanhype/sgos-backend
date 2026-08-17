@@ -310,14 +310,18 @@ def _convert_to_wgp_format(job: dict) -> dict:
     return out
 
 
-async def _send_flux3(brief: dict) -> bool:
-    """Navigate ego-bridge to #gen-1 and send the Flux3 /t2v command."""
+async def _send_flux3(brief: dict) -> dict:
+    """Navigate ego-bridge to #gen-1 and send the Flux3 /t2v command.
+
+    Returns dict with 'sent' (bool) and optionally 'message_id' (str) of the
+    sent message for targeted reply tracking.
+    """
     inner = brief.get("brief", brief)
     pp = inner.get("production_prompts", {})
     flux3_cmd = pp.get("flux3")
     if not flux3_cmd:
         logger.error("_send_flux3: no flux3 prompt in brief production_prompts")
-        return False
+        return {"sent": False}
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             await client.post(f"{EGO_BRIDGE_URL}/v1/navigate",
@@ -335,7 +339,7 @@ async def _send_flux3(brief: dict) -> bool:
             result_val = rdata.get("result") or rdata.get("output", "")
             if "ok" not in str(result_val):
                 logger.error(f"_send_flux3: could not focus Discord input: {rdata}")
-                return False
+                return {"sent": False}
             await client.post(f"{EGO_BRIDGE_URL}/v1/type",
                               json={"selector": 'div[contenteditable=true][aria-label^="Message"]', "text": flux3_cmd})
             await asyncio.sleep(1)
@@ -347,11 +351,36 @@ async def _send_flux3(brief: dict) -> bool:
                 "return e.dispatchEvent(k);})()"
             )
             await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": enter_js})
-        logger.info("_send_flux3: sent Flux3 command to Discord")
-        return True
+            logger.info("_send_flux3: sent Flux3 command to Discord")
+
+            # Wait for our message to appear, then extract its message ID
+            await asyncio.sleep(3)
+            message_id = None
+            # Use a snippet of the prompt to identify OUR message
+            prompt_snippet = flux3_cmd[:60].replace("'", "\\'").replace("\n", " ")
+            js_msg_id = (
+                f"(()=>{{"
+                f"const msgs=[...document.querySelectorAll('[data-message-id]')];"
+                f"const mine=msgs.filter(m=>m.textContent.includes('{prompt_snippet}'));"
+                f"if(mine.length===0) return '';"
+                f"return mine[mine.length-1].getAttribute('data-message-id')||'';"
+                f"}})()"
+            )
+            try:
+                r2 = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js_msg_id})
+                mid = (r2.json().get("result") or "").strip()
+                if mid and mid.isdigit():
+                    message_id = mid
+                    logger.info(f"_send_flux3: captured message_id={message_id}")
+                else:
+                    logger.warning(f"_send_flux3: could not extract message_id (got '{mid}')")
+            except Exception as exc:
+                logger.warning(f"_send_flux3: message_id extraction failed: {exc}")
+
+            return {"sent": True, "message_id": message_id}
     except Exception as exc:
         logger.error(f"_send_flux3: failed: {exc}")
-        return False
+        return {"sent": False}
 
 
 # Flux3 result polling: poll each 15s for up to ~5 minutes (20 attempts).
@@ -386,40 +415,121 @@ async def _collect_cdn_urls() -> set[str]:
         return set()
 
 
-async def _poll_flux3(seen_urls: Optional[set] = None) -> Optional[str]:
-    """Poll Discord for a NEW result.mp4 CDN url (the factory's own submission).
+def _reply_cdn_js(message_id: Optional[str] = None) -> str:
+    """JS to collect CDN mp4 URLs from reply messages to a specific message_id.
 
-    - Polls every FLUX_POLL_INTERVAL (15s) for up to ~5 minutes.
-    - Reads ALL video source urls (not just the first match).
-    - Skips URLs already present before this submission (`seen_urls`).
-    - Logs each attempt so Docker logs show exactly what's happening.
-    Returns the new full signed CDN URL, or None on timeout.
+    If message_id is provided, only scans messages that are replies to it.
+    Falls back to scanning all video URLs if message_id is None.
+    """
+    if message_id:
+        # Find messages replying to our message_id, extract video URLs from those
+        return (
+            f"(()=>{{"
+            f"const targetId='{message_id}';"
+            f"const urls=new Set();"
+            # Discord reply messages reference the parent via aria-label or data attributes
+            f"const allMsgs=[...document.querySelectorAll('[data-message-id]')];"
+            f"const replies=allMsgs.filter(m=>{{"
+            f"  const ref=m.querySelector('[class*=reply]');"
+            f"  const label=m.getAttribute('aria-label')||'';"
+            f"  const text=m.textContent||'';"
+            f"  return ref&&ref.closest('[data-message-id=\"'+targetId+'\']')"
+            f"    ||label.includes(targetId)"
+            f"    ||text.includes(targetId);"
+            f"}});"
+            f"replies.forEach(msg=>{{"
+            f"  msg.querySelectorAll('video source, video[src]').forEach(v=>{{"
+            f"    const s=(v.currentSrc||v.src||'').split('?')[0];"
+            f"    if(s.includes('cdn.discordapp.com')&&s.includes('.mp4'))urls.add(s);"
+            f"  }});"
+            f"}});"
+            f"return JSON.stringify({{urls:[...urls],replyCount:replies.length}});"
+            f"}})()"
+        )
+    else:
+        # Fallback: scan all video URLs (original behavior)
+        return _cdn_js()
+
+
+async def _poll_flux3(
+    seen_urls: Optional[set] = None,
+    message_id: Optional[str] = None,
+) -> Optional[str]:
+    """Poll Discord for result.mp4 CDN url from Flux3 bot reply.
+
+    Primary mode (message_id set): looks for bot replies to our specific message.
+    Fallback mode (message_id None): scans all new video URLs vs baseline.
+
+    Polls every FLUX_POLL_INTERVAL (15s) for up to ~5 minutes.
+    Returns the full signed CDN URL, or None on timeout.
     """
     seen = set(seen_urls or set())
+    mode = "targeted" if message_id else "baseline"
     logger.info(
-        f"_poll_flux3: polling every {FLUX_POLL_INTERVAL}s, "
-        f"up to {FLUX_POLL_ATTEMPTS} attempts; baseline seen={len(seen)} urls"
+        f"_poll_flux3: {mode} mode, polling every {FLUX_POLL_INTERVAL}s, "
+        f"up to {FLUX_POLL_ATTEMPTS} attempts"
+        + (f"; message_id={message_id}" if message_id else f"; baseline seen={len(seen)} urls")
     )
     async with httpx.AsyncClient(timeout=30) as client:
         for attempt in range(1, FLUX_POLL_ATTEMPTS + 1):
             try:
-                r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": _cdn_js()})
+                js = _reply_cdn_js(message_id)
+                r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js})
                 raw = (r.json().get("result") or "").strip()
-                urls = json.loads(raw) if raw.startswith("[") else []
-                new = [u for u in urls if u not in seen]
-                logger.info(
-                    f"_poll_flux3: attempt {attempt}/{FLUX_POLL_ATTEMPTS} "
-                    f"found {len(urls)} cdn urls, {len(new)} new"
-                )
-                if new:
-                    # Return the newest (last) new full URL with its signed token.
-                    full = new[-1]
-                    logger.info(f"_poll_flux3: detected new result: {full}")
-                    return full
+
+                if message_id:
+                    # Targeted mode: parse structured response
+                    try:
+                        data = json.loads(raw) if raw.startswith("{") else {"urls": [], "replyCount": 0}
+                        urls = data.get("urls", [])
+                        reply_count = data.get("replyCount", 0)
+                        logger.info(
+                            f"_poll_flux3: attempt {attempt}/{FLUX_POLL_ATTEMPTS} "
+                            f"found {reply_count} replies, {len(urls)} cdn urls"
+                        )
+                        if urls:
+                            full = urls[-1]
+                            logger.info(f"_poll_flux3: targeted result from reply: {full}")
+                            return full
+                    except json.JSONDecodeError:
+                        logger.warning(f"_poll_flux3: could not parse targeted response: {raw[:100]}")
+                else:
+                    # Baseline fallback mode
+                    urls = json.loads(raw) if raw.startswith("[") else []
+                    new = [u for u in urls if u not in seen]
+                    logger.info(
+                        f"_poll_flux3: attempt {attempt}/{FLUX_POLL_ATTEMPTS} "
+                        f"found {len(urls)} cdn urls, {len(new)} new"
+                    )
+                    if new:
+                        full = new[-1]
+                        logger.info(f"_poll_flux3: baseline result: {full}")
+                        return full
             except Exception as exc:
                 logger.warning(f"_poll_flux3: attempt {attempt} error: {exc}")
             await asyncio.sleep(FLUX_POLL_INTERVAL)
-    logger.error(f"_poll_flux3: no new result after {FLUX_POLL_ATTEMPTS} attempts")
+
+    # If targeted mode failed, try one round of baseline as last resort
+    if message_id:
+        logger.warning("_poll_flux3: targeted mode found nothing, trying baseline fallback")
+        try:
+            baseline_seen = await _collect_cdn_urls()
+        except Exception:
+            baseline_seen = set()
+        # Quick single-pass baseline check
+        await asyncio.sleep(FLUX_POLL_INTERVAL)
+        try:
+            r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": _cdn_js()})
+            raw = (r.json().get("result") or "").strip()
+            urls = json.loads(raw) if raw.startswith("[") else []
+            new = [u for u in urls if u not in baseline_seen]
+            if new:
+                logger.info(f"_poll_flux3: baseline fallback found result: {new[-1]}")
+                return new[-1]
+        except Exception:
+            pass
+
+    logger.error(f"_poll_flux3: no result after {FLUX_POLL_ATTEMPTS} attempts ({mode} mode)")
     return None
 
 
@@ -666,6 +776,20 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path, provenance: Optional[d
         return None
 
     if not output_file:
+        # The tmux session may have ended just after our last poll — the bridge
+        # then reports `complete` with the latest output file. Do one final
+        # status query before giving up so a just-finished job isn't lost.
+        try:
+            async with httpx.AsyncClient(timeout=30, headers=api_headers) as client:
+                rr = await client.get(f"{H3_BRIDGE_URL}/v1/h3/status/{session_name}")
+                final = (rr.json() or {}) if rr.status_code == 200 else {}
+            if final.get("status") == "complete" and final.get("output_file"):
+                output_file = final.get("output_file")
+                logger.info(f"_submit_and_poll_h3: recovered output_file on final status: {output_file}")
+        except Exception as exc:
+            logger.warning(f"_submit_and_poll_h3: final status probe failed: {exc}")
+
+    if not output_file:
         logger.error(f"_submit_and_poll_h3: no output_file after timeout for {session_name}")
         return None
 
@@ -744,23 +868,29 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[d
     """
     provenance = provenance or {}
     try:
-        sent = await _send_flux3(brief)
+        send_result = await _send_flux3(brief)
     except Exception as exc:
         logger.error(f"_send_and_poll_flux: _send_flux3 raised: {exc}")
         return None
-    if not sent:
+    if not send_result.get("sent"):
         logger.error("_send_and_poll_flux: send returned False (see _send_flux3 log)")
         return None
 
-    # Baseline: URLs already on the channel right after our send. Our result
-    # will be a NEW cdn.mp4 not present here, so we can attribute it to us.
+    message_id = send_result.get("message_id")
+    if message_id:
+        logger.info(f"_send_and_poll_flux: using targeted tracking with message_id={message_id}")
+    else:
+        logger.info("_send_and_poll_flux: message_id unavailable, falling back to baseline mode")
+
+    # Baseline: URLs already on the channel right after our send. Used as
+    # fallback if message_id tracking fails.
     try:
         seen = await _collect_cdn_urls()
     except Exception as exc:
         logger.warning(f"_send_and_poll_flux: baseline collection failed: {exc}")
         seen = set()
 
-    url = await _poll_flux3(seen)
+    url = await _poll_flux3(seen, message_id=message_id)
     if not url:
         logger.error("_send_and_poll_flux: poll returned no NEW URL")
         return None
