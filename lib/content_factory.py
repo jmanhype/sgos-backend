@@ -69,7 +69,7 @@ FLUX_GEN_CHANNEL = os.environ.get(
 )
 
 # Cap how long we wait for one production (H3 or Flux3) before giving up.
-H3_POLL_SECONDS = int(os.environ.get("H3_POLL_SECONDS", "900"))
+H3_POLL_SECONDS = int(os.environ.get("H3_POLL_SECONDS", "1800"))
 # Disabled in favor of FLUX_POLL_INTERVAL/ATTEMPTS in _poll_flux3 above (kept
 # for backward env compatibility of the overall poll budget, not used):
 FLUX_POLL_SECONDS = int(os.environ.get("FLUX_POLL_SECONDS", "900"))
@@ -356,14 +356,17 @@ async def _send_flux3(brief: dict) -> dict:
             # Wait for our message to appear, then extract its message ID
             await asyncio.sleep(3)
             message_id = None
-            # Use a snippet of the prompt to identify OUR message
+            # Discord uses id="chat-messages-{channel_id}-{message_id}" format
+            # Extract message IDs from elements whose id matches that pattern
             prompt_snippet = flux3_cmd[:60].replace("'", "\\'").replace("\n", " ")
             js_msg_id = (
                 f"(()=>{{"
-                f"const msgs=[...document.querySelectorAll('[data-message-id]')];"
-                f"const mine=msgs.filter(m=>m.textContent.includes('{prompt_snippet}'));"
-                f"if(mine.length===0) return '';"
-                f"return mine[mine.length-1].getAttribute('data-message-id')||'';"
+                f"const els=[...document.querySelectorAll('li[id],div[id]')];"
+                f"const msgEls=els.filter(e=>e.id.match(/\\d{{17,20}}$/)&&e.textContent.includes('{prompt_snippet}'));"
+                f"if(msgEls.length===0) return '';"
+                f"const last=msgEls[msgEls.length-1];"
+                f"const m=last.id.match(/(\\d{{17,20}})$/);"
+                f"return m?m[1]:'';"
                 f"}})()"
             )
             try:
@@ -422,24 +425,24 @@ def _reply_cdn_js(message_id: Optional[str] = None) -> str:
     Falls back to scanning all video URLs if message_id is None.
     """
     if message_id:
-        # Find messages replying to our message_id, extract video URLs from those
+        # Discord uses id="chat-messages-{channel}-{msg_id}" format
+        # Reply messages contain a reference to the parent message
         return (
             f"(()=>{{"
             f"const targetId='{message_id}';"
             f"const urls=new Set();"
-            # Discord reply messages reference the parent via aria-label or data attributes
-            f"const allMsgs=[...document.querySelectorAll('[data-message-id]')];"
-            f"const replies=allMsgs.filter(m=>{{"
-            f"  const ref=m.querySelector('[class*=reply]');"
-            f"  const label=m.getAttribute('aria-label')||'';"
+            # Find all message elements with numeric IDs
+            f"const allEls=[...document.querySelectorAll('li[id],div[id]')];"
+            f"const msgEls=allEls.filter(e=>e.id.match(/\\d{{17,20}}$/));"
+            # Filter to replies: elements whose text or child refs mention our message_id
+            f"const replies=msgEls.filter(m=>{{"
             f"  const text=m.textContent||'';"
-            f"  return ref&&ref.closest('[data-message-id=\"'+targetId+'\']')"
-            f"    ||label.includes(targetId)"
-            f"    ||text.includes(targetId);"
+            f"  const refLink=m.querySelector('a[href*=\"'+targetId+'\"]');"
+            f"  return refLink||text.includes(targetId);"
             f"}});"
             f"replies.forEach(msg=>{{"
             f"  msg.querySelectorAll('video source, video[src]').forEach(v=>{{"
-            f"    const s=(v.currentSrc||v.src||'').split('?')[0];"
+            f"    const s=v.src||v.currentSrc||'';"
             f"    if(s.includes('cdn.discordapp.com')&&s.includes('.mp4'))urls.add(s);"
             f"  }});"
             f"}});"
