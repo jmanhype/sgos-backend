@@ -79,10 +79,34 @@ def _load_franchises() -> list[str]:
     Each top-level dir is treated as a franchise group, and any markdown file
     inside contributes its stem. Leading `YYYY-MM-DD_` date prefixes are
     stripped so generated premises read naturally.
+
+    Falls back to a built-in list from the SGFLIX Lost Futures index when
+    the external gist-archive directory isn't available (e.g. inside Docker).
     """
     import re as _re
     if not LOST_FUTURES_INDEX.is_dir():
-        return []
+        # Built-in fallback: top franchises from sgflix-lost-futures-index
+        return [
+            "magnitude-kaiju", "proximity-kaiju", "kart-hell-95",
+            "megacorp-office", "jurassic-live-pd", "fnaf-cctv",
+            "arcade-demons", "block-mission", "curriculum-breach",
+            "inner-voltage", "darkknight-sentai", "grove-street-stories",
+            "aisle-13", "bone-kitchen", "cloud-gardener",
+            "cosmonaut-9", "crimson-kabuki", "cul-de-sac-jutsu",
+            "dissolve", "el-coyote", "jade-express",
+            "iron-hands", "daughters-of-the-sun",
+            "mario-kart-twisted-metal", "imperial-hr",
+            "hawkins-911", "daily-bugle", "hbo-muppets",
+            "kitchen-nightmares", "warhammer-40k",
+            "pokemon-underground", "godzilla-iphone-pov",
+            "bodycam-chaos", "ecohorror-puppet", "soviet-space-opera",
+            "mall-slasher", "evidence-room-toy", "occult-school",
+            "fitness-vhs", "ninja-hoa", "aquatic-puppet",
+            "factory-mascot", "fashion-doll-recruitment",
+            "used-car-robot", "wall-crawler-psa", "teen-counseling",
+            "cursed-relic-fantasy", "tuner-racing", "toddler-mascot",
+            "superteam-disaster",
+        ]
     franchises: list[str] = []
     def clean(name: str) -> str:
         return _re.sub(r"^\d{4}-\d{2}-\d{2}_", "", name)
