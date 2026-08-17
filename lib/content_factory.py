@@ -326,6 +326,8 @@ async def _send_flux3(brief: dict) -> bool:
         async with httpx.AsyncClient(timeout=60) as client:
             await client.post(f"{EGO_BRIDGE_URL}/v1/navigate",
                               json={"url": FLUX_GEN_CHANNEL, "wait": True, "timeout": 40})
+            # Discord needs time to settle after navigation
+            await asyncio.sleep(5)
             # Find & focus the Discord message box, type, then press Enter.
             js_focus = (
                 "(()=>{const e=[...document.querySelectorAll('div[contenteditable=true]')]"
@@ -333,11 +335,14 @@ async def _send_flux3(brief: dict) -> bool:
                 "if(e){e.focus(); return 'ok';} return 'no-input';})()"
             )
             r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js_focus})
-            if r.json().get("result") != "ok":
-                logger.error("_send_flux3: could not focus Discord input")
+            rdata = r.json()
+            result_val = rdata.get("result") or rdata.get("output", "")
+            if "ok" not in str(result_val):
+                logger.error(f"_send_flux3: could not focus Discord input: {rdata}")
                 return False
             await client.post(f"{EGO_BRIDGE_URL}/v1/type",
-                              json={"selector": '[aria-label="Message"]', "text": flux3_cmd})
+                              json={"selector": 'div[contenteditable=true][aria-label^="Message"]', "text": flux3_cmd})
+            await asyncio.sleep(1)
             enter_js = (
                 "(()=>{const e=[...document.querySelectorAll('div[contenteditable=true]')]"
                 ".find(x=>(x.getAttribute('aria-label')||'').startsWith('Message'));"

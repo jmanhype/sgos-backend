@@ -4,6 +4,7 @@ Slim app factory: registers middleware and routers.
 All business logic lives in routers/ modules.
 """
 import hmac
+import os
 import time
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -86,9 +87,12 @@ async def lifespan(app: FastAPI):
         log.warning("auth.disabled", hint="Set SGOS_API_KEY for production")
         log.error("auth.production_risk", detail="Server has NO authentication — any network-accessible deployment is fully open")
 
-    # Start background ingestion scheduler
-    init_scheduler()
-    log.info("scheduler.started")
+    # Start background ingestion scheduler (skip in factory-only mode)
+    if not os.environ.get("SGOS_FACTORY_ONLY"):
+        init_scheduler()
+        log.info("scheduler.started")
+    else:
+        log.info("scheduler.skipped", reason="SGOS_FACTORY_ONLY mode")
 
     yield
 
