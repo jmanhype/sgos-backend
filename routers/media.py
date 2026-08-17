@@ -6,7 +6,18 @@ import urllib.request
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 
 from config import settings
-from transcribe import transcribe as whisper_transcribe, format_transcript, WHISPER_AVAILABLE
+
+# Lazy-load heavy whisper import — only when transcription endpoint is hit
+_whisper_cache = {}
+
+def _get_whisper():
+    """Lazy-load faster_whisper on first use."""
+    if "transcribe" not in _whisper_cache:
+        from transcribe import transcribe, format_transcript, WHISPER_AVAILABLE
+        _whisper_cache["transcribe"] = transcribe
+        _whisper_cache["format_transcript"] = format_transcript
+        _whisper_cache["available"] = WHISPER_AVAILABLE
+    return _whisper_cache
 
 router = APIRouter(tags=["media"])
 
@@ -33,7 +44,8 @@ def _validate_external_url(url: str) -> str | None:
 @router.get("/transcribe/status")
 async def transcribe_status():
     """Check if Whisper transcription is available."""
-    return {"available": WHISPER_AVAILABLE, "engine": "faster-whisper", "ffmpeg": True}
+    w = _get_whisper()
+    return {"available": w.get("available", False), "engine": "faster-whisper", "ffmpeg": True}
 
 
 @router.post("/transcribe")
@@ -44,7 +56,8 @@ async def transcribe_file(
     format_type: str = Query("summary", description="Output format: text, timestamped, srt, summary"),
 ):
     """Transcribe a video or audio file using Whisper."""
-    if not WHISPER_AVAILABLE:
+    w = _get_whisper()
+    if not w.get("available"):
         raise HTTPException(status_code=503, detail="faster-whisper not installed")
 
     max_bytes = settings.max_upload_bytes
@@ -67,8 +80,8 @@ async def transcribe_file(
         tmp_path = tmp.name
 
     try:
-        result = whisper_transcribe(tmp_path, model_size=model_size, language=language)
-        formatted = format_transcript(result, format_type)
+        result = w["transcribe"](tmp_path, model_size=model_size, language=language)
+        formatted = w["format_transcript"](result, format_type)
         result["formatted"] = formatted
         return result
     finally:
@@ -81,7 +94,8 @@ async def transcribe_url(
     model_size: str = Query("base"),
 ):
     """Transcribe from a URL (downloads first)."""
-    if not WHISPER_AVAILABLE:
+    w = _get_whisper()
+    if not w.get("available"):
         raise HTTPException(status_code=503, detail="faster-whisper not installed")
 
     url_error = _validate_external_url(url)
@@ -116,7 +130,7 @@ async def transcribe_url(
                     )
                 f.write(chunk)
 
-        result = whisper_transcribe(tmp_path, model_size=model_size)
+        result = w["transcribe"](tmp_path, model_size=model_size)
         return result
     finally:
         if os.path.exists(tmp_path):

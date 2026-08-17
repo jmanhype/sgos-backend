@@ -1,13 +1,12 @@
 """
 Firecrawl Deep-Scrape Module
-Scrapes full article text from outlier URLs using Firecrawl on 3090-lan:3002.
+Scrapes full article text from outlier URLs using local Firecrawl (localhost:3002).
 Stores scraped content back into the posts table for richer idea generation.
 """
 import subprocess
 import json
 import os
 import sys
-import shlex
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -16,7 +15,7 @@ from database import get_connection
 
 # ─── Firecrawl Access ─────────────────────────────────────────────────────────
 
-FIRECRAWL_HOST = os.environ.get("FIRECRAWL_HOST", "3090-lan")
+FIRECRAWL_HOST = "localhost"  # Local Docker Firecrawl
 FIRECRAWL_PORT = int(os.environ.get("FIRECRAWL_PORT", "3002"))
 
 ALLOWED_URL_SCHEMES = {"http", "https"}
@@ -42,11 +41,13 @@ def _validate_url(url: str) -> str | None:
 
 def scrape_url(url: str, timeout: int = 30) -> dict:
     """
-    Scrape a URL via Firecrawl on 3090-lan.
+    Scrape a URL via local Firecrawl (localhost:3002).
     
     Returns:
         Dict with: markdown, metadata, success status
     """
+    import urllib.request
+    
     if not url:
         return {"success": False, "error": "No URL provided"}
     
@@ -55,29 +56,22 @@ def scrape_url(url: str, timeout: int = 30) -> dict:
     if url_error:
         return {"success": False, "error": url_error}
     
-    # Build the curl command to run on 3090
+    # Direct HTTP call to local Firecrawl
     payload = json.dumps({
         "url": url,
         "formats": ["markdown"],
-    })
+    }).encode()
     
-    # Use shlex.quote to safely escape the payload for shell execution
-    ssh_cmd = (
-        f"curl -s -X POST http://localhost:{FIRECRAWL_PORT}/v1/scrape "
-        f"-H 'Content-Type: application/json' "
-        f"-d {shlex.quote(payload)}"
+    req = urllib.request.Request(
+        f"http://localhost:{FIRECRAWL_PORT}/v1/scrape",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     
     try:
-        result = subprocess.run(
-            ["ssh", FIRECRAWL_HOST, ssh_cmd],
-            capture_output=True, text=True, timeout=timeout
-        )
-        
-        if result.returncode != 0:
-            return {"success": False, "error": f"SSH failed: {result.stderr[:200]}"}
-        
-        data = json.loads(result.stdout)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
         
         if not data.get("success"):
             return {"success": False, "error": data.get("error", "Unknown error")}
@@ -93,8 +87,8 @@ def scrape_url(url: str, timeout: int = 30) -> dict:
             "word_count": len(page_data.get("markdown", "").split()),
         }
     
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": f"Timeout after {timeout}s"}
+    except urllib.error.URLError as e:
+        return {"success": False, "error": f"Firecrawl unreachable: {e}"}
     except json.JSONDecodeError:
         return {"success": False, "error": "Invalid JSON response from Firecrawl"}
     except Exception as e:
@@ -114,17 +108,14 @@ def deep_scrape_post(post_id: str) -> dict:
     # Find the post
     row = c.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
     if not row:
-        conn.close()
         return {"success": False, "error": f"Post not found: {post_id}"}
     
     post = dict(row)
     url = post.get("url", "")
     
     if not url:
-        conn.close()
         return {"success": False, "error": "Post has no URL"}
     
-    conn.close()
     
     # Scrape
     print(f"🔥 Scraping: {url}")
@@ -163,7 +154,6 @@ def deep_scrape_post(post_id: str) -> dict:
             pass  # FTS table may not exist or have different schema
         
         conn.commit()
-        conn.close()
     
     return {
         "success": True,
@@ -196,7 +186,6 @@ def deep_scrape_outliers(threshold: float = 3.0, limit: int = 5, hours: int = 48
     """, (threshold, limit)).fetchall()
     
     outliers = [dict(r) for r in rows]
-    conn.close()
     
     if not outliers:
         return {"status": "no_outliers", "message": "No unscraped outliers found", "results": []}
@@ -231,7 +220,6 @@ def ensure_scraped_at_column():
         print("✅ Added scraped_at column to posts table")
     except Exception:
         pass  # Column already exists
-    conn.close()
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────

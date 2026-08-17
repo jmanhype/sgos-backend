@@ -131,3 +131,112 @@ async def ingest_search_endpoint(
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     return {"status": "started", "queries": queries, "time_range": time_range}
+
+
+# ─── Admin Endpoints ──────────────────────────────────────────────────────────
+
+@router.get("/ingest/scheduler")
+async def scheduler_status():
+    """Get scheduler status: running jobs, intervals, next run times."""
+    from scheduler import scheduler
+    return scheduler.status()
+
+
+@router.get("/ingest/sources")
+async def ingestion_sources():
+    """List all configured ingestion sources and their status."""
+    from database import get_connection
+    conn = get_connection()
+    
+    # Count posts per platform
+    platform_counts = conn.execute(
+        "SELECT platform, COUNT(*) as count, MAX(ingested_at) as last_seen FROM posts GROUP BY platform ORDER BY count DESC"
+    ).fetchall()
+    
+    # Get subreddit targets
+    sources = []
+    for row in platform_counts:
+        source = {
+            "platform": row["platform"],
+            "post_count": row["count"],
+            "last_ingested": row["last_seen"],
+        }
+        # Add subreddit detail for Reddit
+        if row["platform"] == "reddit":
+            sub_counts = conn.execute(
+                "SELECT subreddit, COUNT(*) as count FROM posts WHERE platform='reddit' AND subreddit IS NOT NULL GROUP BY subreddit ORDER BY count DESC"
+            ).fetchall()
+            source["subreddits"] = {r["subreddit"]: r["count"] for r in sub_counts}
+            source["configured_subreddits"] = TARGET_SUBREDDITS
+        sources.append(source)
+    
+    
+    # Add configured topic queries
+    return {
+        "sources": sources,
+        "topic_categories": list(TOPIC_QUERIES.keys()),
+        "total_posts": sum(r["count"] for r in platform_counts),
+    }
+
+
+@router.get("/alerts/config")
+async def get_alerts_config():
+    """Get current alert configuration."""
+    from alert_system import get_alert_config
+    config = get_alert_config()
+    # Don't expose full token
+    if config.get("bot_token"):
+        config["bot_token"] = config["bot_token"][:8] + "..." + config["bot_token"][-4:]
+    return config
+
+
+@router.put("/alerts/config")
+async def update_alerts_config(
+    threshold: float = Query(None, description="Z-score threshold for alerts"),
+    cooldown_hours: int = Query(None, description="Hours between alerts for same post"),
+    chat_id: str = Query(None, description="Telegram chat ID"),
+    enabled: bool = Query(None, description="Enable/disable alerts"),
+):
+    """Update alert configuration. Persists to .env file."""
+    import os
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    
+    updates = {}
+    if threshold is not None:
+        updates["OUTLIER_ALERT_THRESHOLD"] = str(threshold)
+        os.environ["OUTLIER_ALERT_THRESHOLD"] = str(threshold)
+    if cooldown_hours is not None:
+        updates["ALERT_COOLDOWN_HOURS"] = str(cooldown_hours)
+        os.environ["ALERT_COOLDOWN_HOURS"] = str(cooldown_hours)
+    if chat_id is not None:
+        updates["TELEGRAM_CHAT_ID"] = chat_id
+        os.environ["TELEGRAM_CHAT_ID"] = chat_id
+    if enabled is not None:
+        updates["ALERTS_ENABLED"] = str(enabled).lower()
+        os.environ["ALERTS_ENABLED"] = str(enabled).lower()
+    
+    # Persist to .env
+    if updates and os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            lines = f.readlines()
+        
+        existing_keys = set()
+        for i, line in enumerate(lines):
+            key = line.split("=")[0].strip() if "=" in line else ""
+            if key in updates:
+                lines[i] = f"{key}={updates[key]}\n"
+                existing_keys.add(key)
+        
+        # Append new keys
+        for key, val in updates.items():
+            if key not in existing_keys:
+                lines.append(f"{key}={val}\n")
+        
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+    
+    from alert_system import get_alert_config
+    config = get_alert_config()
+    if config.get("bot_token"):
+        config["bot_token"] = config["bot_token"][:8] + "..." + config["bot_token"][-4:]
+    return {"status": "updated", "updates": list(updates.keys()), "config": config}

@@ -21,17 +21,15 @@ def init_vector_tables():
             post_id TEXT PRIMARY KEY,
             title TEXT,
             content TEXT,
-            tfidf_vector TEXT,  -- JSON: {"word": weight, ...}
+            tfidf_vector TEXT,
             norm REAL DEFAULT 0,
             platform TEXT,
             subreddit TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (post_id) REFERENCES posts(platform_id)
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     conn.commit()
-    conn.close()
 
 
 def tokenize(text: str) -> list[str]:
@@ -131,7 +129,6 @@ def build_index(platform: str = None, rebuild: bool = False) -> dict:
     posts = [dict(r) for r in rows]
 
     if not posts:
-        conn.close()
         return {"error": "No posts to index"}
 
     # Check what's already indexed
@@ -141,7 +138,6 @@ def build_index(platform: str = None, rebuild: bool = False) -> dict:
         posts = [p for p in posts if p.get('platform_id') not in indexed_ids]
 
     if not posts:
-        conn.close()
         return {"status": "up_to_date", "total_indexed": len(indexed_ids) if not rebuild else 0}
 
     # Compute TF-IDF vectors
@@ -172,7 +168,6 @@ def build_index(platform: str = None, rebuild: bool = False) -> dict:
 
     conn.commit()
     total = conn.execute("SELECT COUNT(*) as cnt FROM post_embeddings").fetchone()['cnt']
-    conn.close()
 
     return {
         "status": "built",
@@ -192,7 +187,6 @@ def search_similar(query_text: str, limit: int = 10, platform: str = None) -> li
     # Compute query vector first
     query_tokens = tokenize(query_text)
     if not query_tokens:
-        conn.close()
         return []
 
     query_tf = Counter(query_tokens)
@@ -210,7 +204,6 @@ def search_similar(query_text: str, limit: int = 10, platform: str = None) -> li
     rows = conn.execute(query_sql, params).fetchall()
 
     if not rows:
-        conn.close()
         return []
 
     # Pre-filter: only compute cosine for docs sharing at least 1 query token
@@ -234,25 +227,32 @@ def search_similar(query_text: str, limit: int = 10, platform: str = None) -> li
                 'similarity': round(sim, 4),
             })
 
-    conn.close()
     results.sort(key=lambda x: x['similarity'], reverse=True)
     return results[:limit]
 
 
 def find_similar_posts(post_id: str, limit: int = 5) -> list[dict]:
     """
-    Find posts similar to a specific post (by platform_id).
+    Find posts similar to a specific post (by platform_id or full id).
     """
     init_vector_tables()
     conn = get_connection()
 
-    # Get the target post's vector
+    # Get the target post's vector — try full id first, then platform_id
     row = conn.execute(
         "SELECT tfidf_vector FROM post_embeddings WHERE post_id=?", (post_id,)
     ).fetchone()
+    
+    # If not found, try extracting platform_id from full id (e.g. "reddit_1jl4b6x" → "1jl4b6x")
+    if not row and "_" in post_id:
+        platform_id = post_id.split("_", 1)[1]
+        row = conn.execute(
+            "SELECT tfidf_vector FROM post_embeddings WHERE post_id=?", (platform_id,)
+        ).fetchone()
+        if row:
+            post_id = platform_id  # use the matched key for exclusion
 
     if not row:
-        conn.close()
         return []
 
     target_vector = json.loads(row['tfidf_vector'])
@@ -276,7 +276,6 @@ def find_similar_posts(post_id: str, limit: int = 5) -> list[dict]:
                 'similarity': round(sim, 4),
             })
 
-    conn.close()
     results.sort(key=lambda x: x['similarity'], reverse=True)
     return results[:limit]
 

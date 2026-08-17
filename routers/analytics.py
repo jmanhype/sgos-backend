@@ -1,5 +1,6 @@
 """Analytics endpoints — virality explanation, pattern analysis."""
 from fastapi import APIRouter, HTTPException, Query
+from database import get_connection
 
 router = APIRouter(tags=["analytics"])
 
@@ -27,3 +28,41 @@ async def analytics_patterns(
     """
     from viral_analytics import analyze_viral_patterns
     return analyze_viral_patterns(limit=limit)
+
+
+@router.get("/graph")
+async def conversation_graph():
+    """Return the conversation relationship graph — who's engaging back."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT handle, tier, relationship_score, total_likes_received,
+                   total_replies_received, follows_us, last_engaged_at, notes
+            FROM conversation_graph
+            ORDER BY relationship_score DESC
+        """).fetchall()
+        result = {
+            "total": len(rows),
+            "accounts": [
+                {
+                    "handle": r["handle"],
+                    "tier": r["tier"],
+                    "score": r["relationship_score"],
+                    "likes_received": r["total_likes_received"],
+                    "replies_received": r["total_replies_received"],
+                    "follows_us": bool(r["follows_us"]),
+                    "last_engaged": r["last_engaged_at"],
+                    "notes": r["notes"],
+                }
+                for r in rows
+            ],
+            "summary": {
+                "mutual": sum(1 for r in rows if r["tier"] == "mutual"),
+                "engaged": sum(1 for r in rows if r["tier"] == "engaged"),
+                "warm": sum(1 for r in rows if r["tier"] == "warm"),
+                "stranger": sum(1 for r in rows if r["tier"] == "stranger"),
+            },
+        }
+        return result
+    except Exception as e:
+        return {"error": str(e), "accounts": [], "total": 0}

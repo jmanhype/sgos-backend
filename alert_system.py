@@ -5,12 +5,18 @@ Uses Hermes gateway or direct Telegram Bot API.
 """
 import json
 import os
-import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = os.environ.get("SGOS_DB_PATH", str(Path(__file__).parent / "sgos.db"))
+# Load .env so TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env", override=True)
+except ImportError:
+    pass
+
+from database import get_connection
 
 
 def get_alert_config() -> dict:
@@ -38,7 +44,7 @@ def get_alert_config() -> dict:
             pass
 
     if config["chat_id"] and config["bot_token"]:
-        config["enabled"] = True
+        config["enabled"] = os.environ.get("ALERTS_ENABLED", "true").lower() != "false"
 
     return config
 
@@ -116,6 +122,25 @@ def _format_alert(post: dict) -> str:
     return "\n".join(lines)
 
 
+def _send_telegram_raw(bot_token: str, chat_id: str, message: str) -> dict:
+    """Send a raw Telegram message (no side-effects)."""
+    import urllib.request
+    import urllib.parse
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": message[:4096],
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }).encode()
+
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        result = json.loads(resp.read())
+        return {"status": "sent", "message_id": result.get("result", {}).get("message_id")}
+
+
 def _send_telegram(message: str, config: dict) -> dict:
     """Send alert via Telegram Bot API."""
     import urllib.request
@@ -158,9 +183,8 @@ def _send_hermes(message: str) -> dict:
 
 def _save_local_alert(post: dict, message: str) -> dict:
     """Save alert to local DB when no external channel available."""
-    import sqlite3
-
-    conn = sqlite3.connect(str(DB_PATH))
+    
+    conn = get_connection()
     conn.execute("PRAGMA journal_mode=WAL")
 
     try:
@@ -183,15 +207,12 @@ def _save_local_alert(post: dict, message: str) -> dict:
         return {"status": "saved_local", "post_id": post.get("id", "")}
     except Exception as e:
         return {"status": "error", "error": str(e)}
-    finally:
-        conn.close()
 
 
 def _is_in_cooldown(post: dict, cooldown_hours: int) -> bool:
     """Check if this post was already alerted recently."""
-    import sqlite3
-
-    conn = sqlite3.connect(str(DB_PATH))
+    
+    conn = get_connection()
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS alert_log (
@@ -215,21 +236,18 @@ def _is_in_cooldown(post: dict, cooldown_hours: int) -> bool:
         return row is not None
     except Exception:
         return False
-    finally:
-        conn.close()
 
 
 def _record_alert_sent(message: str):
     """Mark that an alert was sent (for cooldown tracking)."""
     try:
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = get_connection()
         conn.execute("CREATE TABLE IF NOT EXISTS alert_log (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT, sent INTEGER DEFAULT 0, created_at TEXT)")
         conn.execute(
             "INSERT INTO alert_log (message, sent, created_at) VALUES (?, 1, ?)",
             (message[:500], datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
-        conn.close()
     except Exception:
         pass
 
@@ -238,11 +256,12 @@ def check_and_alert_outliers(threshold: float = 3.0, limit: int = 5, hours: int 
     """
     Check for new outliers and send alerts for any above threshold.
     Called by the daily cron pipeline.
+    
+    Optimized: batches all alerts into a single Telegram message instead of
+    N individual HTTP calls (was the #1 API bottleneck at 1.5-5.5s).
     """
-    import sqlite3
-
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+    
+    conn = get_connection()
 
     rows = conn.execute("""
         SELECT * FROM posts
@@ -252,21 +271,59 @@ def check_and_alert_outliers(threshold: float = 3.0, limit: int = 5, hours: int 
         LIMIT ?
     """, (threshold, f"-{hours} hours", limit)).fetchall()
 
-    conn.close()
 
     alerts_sent = 0
     alerts_saved = 0
     results = []
 
+    # Separate into sendable vs skipped
+    sendable = []
     for row in rows:
         post = dict(row)
-        result = send_outlier_alert(post)
-        results.append(result)
+        config = get_alert_config()
+        z_score = post.get("z_score", 0)
+        
+        if z_score < config["threshold"]:
+            results.append({"status": "below_threshold", "z_score": z_score})
+            continue
+        
+        if _is_in_cooldown(post, config["cooldown_hours"]):
+            results.append({"status": "cooldown", "post_id": post.get("id", "")})
+            continue
+        
+        sendable.append(post)
 
-        if result["status"] == "sent":
-            alerts_sent += 1
-        elif result["status"] == "saved_local":
-            alerts_saved += 1
+    # Batch all sendable alerts into ONE Telegram message
+    if sendable:
+        config = get_alert_config()
+        if config["enabled"]:
+            lines = [f"🔥 *{len(sendable)} Viral Outlier{'s' if len(sendable) > 1 else ''}*\n"]
+            for post in sendable:
+                title = post.get("title", "Untitled")[:80]
+                z = post.get("z_score", 0)
+                platform = post.get("platform", "?")
+                score = post.get("score", 0)
+                url = post.get("url", "")
+                lines.append(f"• *{title}*")
+                lines.append(f"  z={z:.1f} | {platform} | score={score}")
+                if url:
+                    lines.append(f"  {url}")
+                lines.append("")
+            
+            message = "\n".join(lines)
+            try:
+                _send_telegram_raw(config["bot_token"], config["chat_id"], message)
+                for post in sendable:
+                    _record_alert_sent(post.get("title", "")[:200])
+                    results.append({"status": "sent", "title": post.get("title", "")})
+                alerts_sent = len(sendable)
+            except Exception as e:
+                for post in sendable:
+                    results.append({"status": "error", "error": str(e)})
+        else:
+            for post in sendable:
+                results.append({"status": "saved_local", "title": post.get("title", "")})
+                alerts_saved += 1
 
     return {
         "checked": len(rows),
@@ -278,10 +335,8 @@ def check_and_alert_outliers(threshold: float = 3.0, limit: int = 5, hours: int 
 
 def get_alert_history(limit: int = 20) -> list[dict]:
     """Get recent alert history."""
-    import sqlite3
-
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+    
+    conn = get_connection()
 
     try:
         conn.execute("""
@@ -302,5 +357,3 @@ def get_alert_history(limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
     except Exception:
         return []
-    finally:
-        conn.close()

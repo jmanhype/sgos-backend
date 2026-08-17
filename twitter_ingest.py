@@ -7,11 +7,9 @@ import time
 import requests
 import json
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from database import get_connection, init_db, upsert_post, update_sub_stats, compute_z_scores
 from creators import init_creator_tables, add_creator, add_creator_post, list_creators
 
-DB_PATH = Path(__file__).parent / "sgos.db"
 
 # Nitter instances (public, may go down — fallback chain)
 NITTER_INSTANCES = [

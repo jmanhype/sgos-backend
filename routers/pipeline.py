@@ -2,7 +2,7 @@
 Pipeline endpoints — Autonomous Viral Content Pipeline API.
 Thin router — all logic delegated to PipelineEngine.
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 
 from services.pipeline import pipeline_engine
 
@@ -14,7 +14,7 @@ async def run_pipeline(
     hours: int = Query(24, ge=1, le=168, description="Outlier lookback window"),
     limit: int = Query(10, ge=1, le=50, description="Max outliers to process"),
     num_variants: int = Query(3, ge=1, le=10, description="Variants per genome"),
-    platform: str = Query("reddit", description="Platform filter"),
+    platform: str = Query("", description="Platform filter (empty = all)"),
     voice_prompt: str = Query("", description="Voice/style guide for generation"),
 ):
     """
@@ -44,8 +44,8 @@ async def run_pipeline(
             from services.pipeline.alerts import alert_high_score
             alert_result = alert_high_score(threshold=75.0)
             result["alerts_sent"] = alert_result.get("notified", 0)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[warn] Pipeline alert error: {e}")
 
     return result
 
@@ -96,6 +96,15 @@ async def regenerate(
     voice_prompt: str = Query(""),
 ):
     """Re-generate variants for an existing genome."""
+    # Auto-load voice profile if not provided
+    if not voice_prompt:
+        try:
+            from voice_profile import get_voice_profile, generate_voice_prompt
+            profile = get_voice_profile("jay_guthrie")
+            if profile:
+                voice_prompt = generate_voice_prompt(profile)
+        except Exception as e:
+            print(f"[warn] Pipeline alert error: {e}")
     result = pipeline_engine.regenerate_for_genome(
         post_id=post_id,
         voice_prompt=voice_prompt,
@@ -169,8 +178,13 @@ async def format_all_platforms(opportunity_id: int):
 @router.post("/opportunities/dismiss-all")
 async def dismiss_all_unseen(
     below_score: float = Query(None, description="Only dismiss opportunities below this score"),
+    body: dict = Body(None),
 ):
-    """Dismiss all unseen opportunities (optionally filtered by score)."""
+    """Dismiss all unseen opportunities (optionally filtered by score).
+    Accepts below_score as query param OR JSON body."""
+    # Accept from body if not in query
+    if below_score is None and body and "below_score" in body:
+        below_score = float(body["below_score"])
     dismissed = pipeline_engine.dismiss_all_unseen(below_score=below_score)
     return {"status": "ok", "dismissed": dismissed, "below_score": below_score}
 

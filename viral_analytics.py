@@ -15,7 +15,6 @@ def explain_virality(post_id: str) -> dict:
     post = conn.execute("""
         SELECT * FROM posts WHERE id = ?
     """, (post_id,)).fetchone()
-    conn.close()
 
     if not post:
         return {"error": "Post not found"}
@@ -57,7 +56,8 @@ JSON response only, no markdown."""
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=800
+            max_tokens=800,
+            extra_body={"enable_thinking": True},
         )
         content = response.choices[0].message.content.strip()
 
@@ -99,7 +99,6 @@ def analyze_viral_patterns(limit: int = 10) -> dict:
         ORDER BY z_score DESC
         LIMIT ?
     """, (limit,)).fetchall()
-    conn.close()
 
     if not viral_posts:
         return {"error": "No viral posts found"}

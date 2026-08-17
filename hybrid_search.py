@@ -115,7 +115,6 @@ def _fts5_search(query: str, limit: int = 40, platform: str = None) -> list[dict
         """, like_params + [limit]).fetchall()
         results = [dict(r) for r in rows]
 
-    conn.close()
     return results
 
 
@@ -149,7 +148,6 @@ def _fetch_post_by_platform_id(platform_id: str) -> dict | None:
     """Fetch full post data by platform_id (used by vector search results)."""
     conn = get_connection()
     row = conn.execute("SELECT * FROM posts WHERE platform_id=?", (platform_id,)).fetchone()
-    conn.close()
     if row:
         return dict(row)
     return None

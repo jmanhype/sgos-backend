@@ -12,13 +12,35 @@ from database import upsert_post, update_sub_stats, compute_z_scores
 # ─── Configuration ───────────────────────────────────────────────
 
 TARGET_SUBREDDITS = [
+    # AI/Tech (viral content)
     "StableDiffusion",
     "artificial",
     "LocalLLaMA",
     "ChatGPT",
     "MachineLearning",
+    "OpenAI",
+    "singularity",
+    "Technology",
+    "Futurology",
+    "programming",
+    
+    # Creator/Marketing (content strategy)
     "socialmedia",
     "NewTubers",
+    "ContentCreation",
+    "Entrepreneur",
+    "Startups",
+    "SaaS",
+    "marketing",
+    "DigitalMarketing",
+    "growthhacking",
+    
+    # Culture/Trends (what's going viral NOW)
+    "InternetIsBeautiful",
+    "dataisbeautiful",
+    "Futurology",
+    "worldnews",
+    "news",
 ]
 
 HEADERS = {
@@ -46,21 +68,26 @@ def _request_with_retry(url: str, params: dict = None, timeout: int = 30, max_re
 
 # ─── Pullpush (Reddit Archive) ──────────────────────────────────
 
-def fetch_pullpush(subreddit: str, size: int = 50, sort: str = "score", sort_type: str = "score") -> list[dict]:
+def fetch_pullpush(subreddit: str, size: int = 50, sort: str = "desc", sort_type: str = "score", days_back: int = 7) -> list[dict]:
     """
     Fetch posts from Pullpush API (Reddit archive, no auth needed).
     https://api.pullpush.io/reddit/search/submission/
     Uses retry with exponential backoff for reliability.
     
     sort_type options: 'score' (top posts), 'created_utc' (newest), 'num_comments' (most discussed)
+    days_back: Only fetch posts from the last N days (default: 7)
     """
     url = "https://api.pullpush.io/reddit/search/submission/"
+
+    # Time filter — only recent posts
+    after_ts = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp())
 
     params = {
         "subreddit": subreddit,
         "size": min(size, 100),
-        "sort": "desc",
+        "sort": sort,
         "sort_type": sort_type,
+        "after": after_ts,
     }
 
     data = _request_with_retry(url, params=params, timeout=45, max_retries=3)
@@ -321,6 +348,39 @@ def ingest_all(subreddits: list[str] = None) -> dict:
     except Exception as e:
         print(f"  ❌ HN ingestion failed: {e}")
         results["hackernews"] = {"error": str(e)}
+
+    # ProductHunt
+    try:
+        from producthunt_ingest import ingest_producthunt
+        ph_result = ingest_producthunt()
+        results["producthunt"] = ph_result
+        total_added += ph_result["added"]
+        total_updated += ph_result["updated"]
+    except Exception as e:
+        print(f"  ❌ ProductHunt ingestion failed: {e}")
+        results["producthunt"] = {"error": str(e)}
+
+    # Lemmy (federated Reddit replacement)
+    try:
+        from lemmy_ingest import ingest_lemmy
+        lemmy_result = ingest_lemmy()
+        results["lemmy"] = lemmy_result
+        total_added += lemmy_result["added"]
+        total_updated += lemmy_result["updated"]
+    except Exception as e:
+        print(f"  ❌ Lemmy ingestion failed: {e}")
+        results["lemmy"] = {"error": str(e)}
+
+    # Lobste.rs (high-quality tech community)
+    try:
+        from lobsters_ingest import ingest_lobsters
+        lobsters_result = ingest_lobsters()
+        results["lobsters"] = lobsters_result
+        total_added += lobsters_result["added"]
+        total_updated += lobsters_result["updated"]
+    except Exception as e:
+        print(f"  ❌ Lobste.rs ingestion failed: {e}")
+        results["lobsters"] = {"error": str(e)}
 
     summary = {
         "total_added": total_added,
