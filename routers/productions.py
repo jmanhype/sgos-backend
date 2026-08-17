@@ -1,0 +1,192 @@
+"""Production catalog API — query, register, and serve generated videos.
+
+Security: video serving uses DB lookup → realpath containment check →
+mimetypes-based Content-Type. Never trusts client-supplied paths or types.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from database import get_connection
+from lib.production_store import (
+    PRODUCTIONS_ROOT,
+    compute_file_hash,
+    get_video_content_type,
+    register_production,
+    resolve_video_path,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/v1/productions", tags=["productions"])
+
+
+class ProductionCreate(BaseModel):
+    style_id: str
+    franchise: str
+    engine: str
+    premise: Optional[str] = None
+    niche: Optional[str] = None
+    qc_status: Optional[str] = "pending"
+    failure_reason: Optional[str] = None
+    seed: Optional[int] = None
+    duration_s: Optional[float] = None
+    resolution: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    file_hash: Optional[str] = None
+    prompt: Optional[str] = None
+    render_duration_s: Optional[float] = None
+
+
+def _row_to_dict(row) -> dict:
+    return dict(row) if row else {}
+
+
+@router.get("")
+def list_productions(
+    date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
+    engine: Optional[str] = Query(None),
+    style: Optional[str] = Query(None),
+    franchise: Optional[str] = Query(None),
+    niche: Optional[str] = Query(None),
+    qc_status: Optional[str] = Query(None),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0),
+):
+    """List productions with optional filters."""
+    conn = get_connection()
+    conditions = []
+    params: list = []
+
+    if date:
+        conditions.append("DATE(generated_at) = ?")
+        params.append(date)
+    if engine:
+        conditions.append("engine = ?")
+        params.append(engine)
+    if style:
+        conditions.append("style_id = ?")
+        params.append(style)
+    if franchise:
+        conditions.append("franchise LIKE ?")
+        params.append(f"%{franchise}%")
+    if niche:
+        conditions.append("niche = ?")
+        params.append(niche)
+    if qc_status:
+        conditions.append("qc_status = ?")
+        params.append(qc_status)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = conn.execute(
+        f"SELECT * FROM productions {where} ORDER BY generated_at DESC LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    ).fetchall()
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM productions {where}", params
+    ).fetchone()[0]
+
+    return {"productions": [_row_to_dict(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/today")
+def today_summary():
+    """Today's production count and summary."""
+    conn = get_connection()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = conn.execute(
+        "SELECT engine, qc_status, COUNT(*) as cnt FROM productions WHERE DATE(generated_at) = ? GROUP BY engine, qc_status",
+        (today,),
+    ).fetchall()
+
+    total = sum(r["cnt"] for r in rows)
+    by_engine: dict = {}
+    for r in rows:
+        eng = r["engine"]
+        if eng not in by_engine:
+            by_engine[eng] = {"total": 0, "ok": 0, "failed": 0, "pending": 0}
+        by_engine[eng]["total"] += r["cnt"]
+        by_engine[eng][r["qc_status"] or "pending"] += r["cnt"]
+
+    return {"date": today, "total": total, "by_engine": by_engine}
+
+
+@router.get("/stats")
+def production_stats():
+    """Aggregate stats by engine, style, qc_status."""
+    conn = get_connection()
+    by_engine = conn.execute(
+        "SELECT engine, COUNT(*) as cnt, AVG(duration_s) as avg_dur FROM productions GROUP BY engine"
+    ).fetchall()
+    by_style = conn.execute(
+        "SELECT style_id, COUNT(*) as cnt FROM productions GROUP BY style_id ORDER BY cnt DESC LIMIT 20"
+    ).fetchall()
+    by_qc = conn.execute(
+        "SELECT qc_status, COUNT(*) as cnt FROM productions GROUP BY qc_status"
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM productions").fetchone()[0]
+
+    return {
+        "total": total,
+        "by_engine": [_row_to_dict(r) for r in by_engine],
+        "top_styles": [_row_to_dict(r) for r in by_style],
+        "by_qc_status": [_row_to_dict(r) for r in by_qc],
+    }
+
+
+@router.get("/{prod_id}")
+def get_production(prod_id: str):
+    """Get a single production by ID."""
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM productions WHERE id = ?", (prod_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Production not found")
+    return _row_to_dict(row)
+
+
+@router.post("")
+def create_production(body: ProductionCreate):
+    """Register a new production. Returns the assigned ID.
+
+    Handles dedup: if (engine, file_hash) already exists, returns existing ID.
+    """
+    prod_id = register_production(body.model_dump())
+    return {"id": prod_id, "status": "created"}
+
+
+@router.get("/{prod_id}/video")
+def serve_video(prod_id: str):
+    """R2: Serve video file for a production.
+
+    Security: looks up file_path from DB by id (never from request),
+    resolves realpath, validates containment within PRODUCTIONS_ROOT,
+    determines Content-Type via mimetypes module. FileResponse supports
+    Range/206 for video scrubbing.
+    """
+    conn = get_connection()
+    row = conn.execute("SELECT file_path FROM productions WHERE id = ?", (prod_id,)).fetchone()
+    if not row or not row["file_path"]:
+        raise HTTPException(404, "Production not found or has no video file")
+
+    # R2: Resolve and validate path containment
+    try:
+        full_path = resolve_video_path(row["file_path"])
+    except ValueError as e:
+        logger.error(f"serve_video path validation failed for {prod_id}: {e}")
+        raise HTTPException(403, "Access denied")
+
+    # R2: Content-Type from mimetypes, never trust client
+    content_type = get_video_content_type(full_path)
+
+    return FileResponse(
+        path=str(full_path),
+        media_type=content_type,
+        filename=full_path.name,
+    )

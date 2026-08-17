@@ -26,6 +26,14 @@ from typing import Any, Optional
 import httpx
 
 from lib.h3_pipeline import build_h3_config_with_fallback
+from lib.production_store import (
+    PRODUCTIONS_ROOT,
+    check_disk_quota,
+    compute_file_hash,
+    get_production_path,
+    register_production,
+    write_meta_sidecar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +168,27 @@ def _append_log(entry: dict) -> None:
     data = _load_log()
     data.append(entry)
     LOG_PATH.write_text(json.dumps(data, indent=2))
+
+
+def _recent_production_exists(style_id: str, franchise: str, premise: str, window_h: int = 24) -> Optional[dict]:
+    """Return the most recent matching `productions` row inside `window_h`, or None.
+
+    Queries the production store's SQLite table directly (best-effort; returns
+    None on any error so dedup never blocks a production).
+    """
+    try:
+        from database import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id, premise, generated_at FROM productions "
+            "WHERE style_id = ? AND franchise = ? AND premise = ? "
+            "AND generated_at >= datetime('now', ?) ORDER BY generated_at DESC LIMIT 1",
+            (style_id, franchise, premise, f"-{window_h} hours"),
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        logger.warning(f"_recent_production_exists: {exc}")
+        return None
 
 
 def pick_next_production() -> dict:
@@ -394,18 +423,89 @@ async def _poll_flux3(seen_urls: Optional[set] = None) -> Optional[str]:
 
 
 def _download(url: str, dest: Path) -> str:
-    """Download (signed CDN url) to dest using a browser UA; returns dest path."""
+    """Download (signed CDN url) to dest using a browser UA; returns dest path.
+
+    Downloads to a `.part` temp file first, then renames atomically, so a
+    partial/failed download never leaves a corrupt final file.
+    """
     import subprocess
     dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
     ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
     r = subprocess.run(
-        ["curl", "-sL", "-m", "120", "-A", ua, "-o", str(dest), url],
+        ["curl", "-sL", "-m", "120", "-A", ua, "-o", str(part), url],
         capture_output=True, text=True, timeout=130,
     )
-    if r.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+    if r.returncode != 0 or not part.exists() or part.stat().st_size == 0:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise RuntimeError(f"download failed for {url}: {r.stderr.strip()}")
+    os.replace(part, dest)  # atomic rename
     return str(dest)
+
+
+async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
+    """Hash, sidecar, register a downloaded media file with the production store.
+
+    Returns the final path string on success, or None on any failure (logged).
+    `meta` must carry engine/kind and identity fields used for registration.
+    """
+    try:
+        file_size = dest.stat().st_size
+        file_hash = await asyncio.to_thread(compute_file_hash, dest)
+        reg_meta = dict(meta)
+        reg_meta.update({
+            "file_path": str(dest),
+            "file_size": file_size,
+            "file_hash": file_hash,
+        })
+        # Sidecar written before registration; register is the durable commit.
+        await asyncio.to_thread(write_meta_sidecar, dest, reg_meta)
+        production_id = await asyncio.to_thread(register_production, reg_meta)
+        logger.info(f"_finalize_media: registered {production_id} size={file_size} hash={file_hash[:12]}")
+        return str(dest)
+    except Exception as exc:
+        logger.error(f"_finalize_media: store write failed: {exc}")
+        return None
+
+
+def _extract_video_meta(path: Path) -> dict:
+    """Best-effort ffprobe of a media file -> {resolution, duration_s}.
+
+    Never fails the caller: returns empty dict if ffprobe is missing/errors.
+    """
+    import json as _json
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "stream=width,height:format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return {}
+        data = _json.loads(r.stdout or "{}")
+        streams = data.get("streams") or []
+        duration_raw = data.get("format", {}).get("duration")
+        resolution = None
+        for s in streams:
+            w, h = s.get("width"), s.get("height")
+            if w and h:
+                resolution = f"{w}x{h}"
+                break
+        duration = None
+        if duration_raw:
+            try:
+                duration = round(float(duration_raw), 2)
+            except (TypeError, ValueError):
+                duration = None
+        return {"resolution": resolution, "duration_s": duration}
+    except Exception:
+        return {}
 
 
 async def run_production_cycle(config: dict) -> dict:
@@ -422,17 +522,35 @@ async def run_production_cycle(config: dict) -> dict:
     brief = brief_resp.get("brief") or {}
     out_dir = Path(config.get("output_dir", str(OUTPUT_DIR)))
 
+    # Dedup guard: warn (but don't block) if this exact production happened recently.
+    try:
+        dup = await asyncio.to_thread(
+            _recent_production_exists, pick.get("style_id", ""),
+            pick.get("franchise", ""), pick.get("premise", ""), 24,
+        )
+        if dup:
+            logger.warning(
+                f"run_production_cycle: duplicate of production "
+                f"{dup.get('id', dup)} within 24h ({pick.get('premise')}); continuing anyway"
+            )
+    except Exception as exc:
+        logger.warning(f"run_production_cycle: dedup check failed: {exc}")
+
     # Kick off H3 + Flux3 concurrently (return_exceptions so one failure
-    # doesn't cancel the other).
-    h3_task = asyncio.create_task(_submit_and_poll_h3(brief, out_dir))
-    flux_task = asyncio.create_task(_send_and_poll_flux(brief, out_dir))
+    # doesn't cancel the other). Pass the pick metadata for registration.
+    provenance = {k: pick.get(k, "") for k in ("style_id", "franchise", "premise", "niche")}
+    h3_task = asyncio.create_task(_submit_and_poll_h3(brief, out_dir, provenance))
+    flux_task = asyncio.create_task(_send_and_poll_flux(brief, out_dir, provenance))
 
     results = await asyncio.gather(h3_task, flux_task, return_exceptions=True)
     h3_video = results[0] if not isinstance(results[0], Exception) else None
     flux3_video = results[1] if not isinstance(results[1], Exception) else None
+    failure_reason = None
     if isinstance(results[0], Exception):
+        failure_reason = str(results[0])
         logger.error(f"run_production_cycle: H3 task raised: {results[0]}")
     if isinstance(results[1], Exception):
+        failure_reason = str(results[1]) or failure_reason
         logger.error(f"run_production_cycle: Flux3 task raised: {results[1]}")
 
     qc_status = "ok" if (h3_video or flux3_video) else "failed"
@@ -446,8 +564,14 @@ async def run_production_cycle(config: dict) -> dict:
         "h3_video": h3_video,
         "flux3_video": flux3_video,
         "qc_status": qc_status,
+        "failure_reason": failure_reason,
     }
-    _append_log(entry)
+    # Primary path: production store. Fallback to the JSON log if it fails.
+    try:
+        register_production(entry)
+    except Exception as exc:
+        logger.error(f"run_production_cycle: store register failed, falling back to log: {exc}")
+        _append_log(entry)
 
     return {"h3_video": h3_video, "flux3_video": flux3_video,
             "brief": brief_resp, "qc_status": qc_status}
@@ -457,7 +581,7 @@ async def run_production_cycle(config: dict) -> dict:
 H3_POLL_INTERVAL = int(os.environ.get("H3_POLL_INTERVAL", "15"))
 
 
-async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
+async def _submit_and_poll_h3(brief: dict, out_dir: Path, provenance: Optional[dict] = None) -> Optional[str]:
     """Submit an H3 job via the host-side h3-bridge and poll/download over HTTP.
 
     Uses H3_BRIDGE_URL (http://host.docker.internal:8041) instead of direct SSH
@@ -465,7 +589,11 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
       POST /v1/h3/submit   {job_json}                 -> {session_name}
       GET  /v1/h3/status/{session}                     -> {status,progress,output_file,error}
       POST /v1/h3/retrieve {remote_filename,local_path}-> {local_path,size}
+
+    On success the result is hashed, given a .meta.json sidecar, and registered
+    with the production store (engine='h3') using `provenance` metadata.
     """
+    provenance = provenance or {}
     inner = brief.get("brief", brief)
     pp = inner.get("production_prompts", {})
     raw_job = pp.get("h3_multishot_json") or pp.get("h3_job_json")
@@ -540,31 +668,80 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
         logger.error(f"_submit_and_poll_h3: no output_file after timeout for {session_name}")
         return None
 
-    # 3) Retrieve via the bridge (HTTP download to local_path).
-    dest = str(out_dir / os.path.basename(output_file))
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    # 3) Retrieve via the bridge (HTTP download to local_path), atomically.
+    render_started = time.time()
+    # Quota guard (Qwen's store exposes min_free_gb; require ≥1GB free).
+    if not await asyncio.to_thread(check_disk_quota, 1.0):
+        logger.error("_submit_and_poll_h3: disk quota exceeded — skipping retrieve")
+        return None
+
+    # Standardized path from the production store; download to .part first.
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    seed = abs(hash(provenance.get("premise", ""))) % (2 ** 31)
+    final_dest = get_production_path(
+        date_str, provenance.get("franchise", ""), "h3", seed
+    )
+    final_dest.parent.mkdir(parents=True, exist_ok=True)
+    part_dest = final_dest.with_suffix(final_dest.suffix + ".part")
     try:
         async with httpx.AsyncClient(timeout=300, headers=api_headers) as client:
             r = await client.post(
                 f"{H3_BRIDGE_URL}/v1/h3/retrieve",
-                json={"remote_filename": output_file, "local_path": dest},
+                json={"remote_filename": output_file, "local_path": str(part_dest)},
             )
             r.raise_for_status()
             data = r.json() or {}
-        logger.info(f"_submit_and_poll_h3: bridge retrieve -> {data}")
-        # Trust the bridge's local_path if returned, else our dest.
-        return data.get("local_path") or dest
+        if not part_dest.exists() or part_dest.stat().st_size == 0:
+            logger.error("_submit_and_poll_h3: retrieve produced empty/absent file")
+            try:
+                part_dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        os.replace(part_dest, final_dest)  # atomic rename to final name
+        render_duration_s = round(time.time() - render_started, 1)
+        logger.info(
+            f"_submit_and_poll_h3: bridge retrieve -> {final_dest} "
+            f"(render {render_duration_s}s, {data.get('size', final_dest.stat().st_size)} bytes)"
+        )
     except Exception as exc:
         logger.error(f"_submit_and_poll_h3: bridge retrieve failed: {exc}")
+        try:
+            part_dest.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
 
+    # 4) Hash, sidecar, register.
+    vid_meta = _extract_video_meta(final_dest)
+    reg_meta = {
+        "engine": "h3",
+        "style_id": provenance.get("style_id", ""),
+        "franchise": provenance.get("franchise", ""),
+        "premise": provenance.get("premise", ""),
+        "niche": provenance.get("niche", ""),
+        "qc_status": "ok",
+        "prompt": (raw_job or {}).get("prompt", ""),
+        "render_duration_s": render_duration_s,
+        "resolution": vid_meta.get("resolution"),
+        "duration_s": vid_meta.get("duration_s"),
+    }
+    finalized = await _finalize_media(final_dest, reg_meta)
+    if not finalized:
+        logger.error("_submit_and_poll_h3: media finalize (hash/sidecar/register) failed")
+        return str(final_dest)  # keep the file even if registration failed
+    return finalized
 
-async def _send_and_poll_flux(brief: dict, out_dir: Path) -> Optional[str]:
+
+async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[dict] = None) -> Optional[str]:
     """Send the Flux3 command, then poll for + download our result.
 
     If the send raises or returns False, log exactly why and return None
     immediately (don't waste a 5-minute poll on a command that never sent).
+    On success the file is atomically placed, hashed, sidecar'd and registered
+    with the production store (engine='flux3') using `provenance` metadata.
     """
+    provenance = provenance or {}
     try:
         sent = await _send_flux3(brief)
     except Exception as exc:
@@ -586,25 +763,72 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path) -> Optional[str]:
     if not url:
         logger.error("_send_and_poll_flux: poll returned no NEW URL")
         return None
+
+    # Quota guard BEFORE downloading (skip if disk is too full).
+    if not await asyncio.to_thread(check_disk_quota, 1.0):
+        logger.error("_send_and_poll_flux: disk quota exceeded — skipping download")
+        return None
+
+    # Standardized path; download to .part first, then atomic rename.
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    seed = abs(hash(provenance.get("premise", ""))) % (2 ** 31)
+    final_dest = get_production_path(
+        date_str, provenance.get("franchise", ""), "flux3", seed
+    )
+    final_dest.parent.mkdir(parents=True, exist_ok=True)
+    part_dest = final_dest.with_suffix(final_dest.suffix + ".part")
     try:
-        dest = out_dir / f"flux3_{int(time.time())}.mp4"
-        # Download via ego-bridge (host has fresh browser cookies for CDN auth)
+        # Download via ego-bridge (host has fresh browser cookies for CDN auth).
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(
                 f"{EGO_BRIDGE_URL}/v1/download",
-                json={"url": url, "output_path": str(dest)},
+                json={"url": url, "output_path": str(part_dest)},
             )
             r.raise_for_status()
             data = r.json()
             size = data.get("size", 0)
-            if size < 1000:
-                logger.error(f"_send_and_poll_flux: downloaded file too small ({size}b), likely expired URL")
+            if size < 1000 or not part_dest.exists() or part_dest.stat().st_size == 0:
+                logger.error(f"_send_and_poll_flux: file too small ({size}b), likely expired URL")
+                try:
+                    part_dest.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 return None
-        logger.info(f"_send_and_poll_flux: downloaded to {dest} ({size} bytes)")
-        return str(dest)
+        os.replace(part_dest, final_dest)  # atomic
+        logger.info(f"_send_and_poll_flux: downloaded to {final_dest} ({size} bytes)")
     except Exception as exc:
         logger.error(f"_send_and_poll_flux: download failed: {exc}")
+        try:
+            part_dest.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
+
+    # Extract the Flux3 prompt (the /t2v command) for registration metadata.
+    prompt = ""
+    _inner = brief.get("brief", brief)
+    pp = _inner.get("production_prompts", {})
+    cmd = pp.get("flux3") or ""
+    if cmd.startswith("/t2v"):
+        prompt = cmd[5:].strip()
+
+    vid_meta = _extract_video_meta(final_dest)
+    reg_meta = {
+        "engine": "flux3",
+        "style_id": provenance.get("style_id", ""),
+        "franchise": provenance.get("franchise", ""),
+        "premise": provenance.get("premise", ""),
+        "niche": provenance.get("niche", ""),
+        "qc_status": "ok",
+        "prompt": prompt,
+        "resolution": vid_meta.get("resolution"),
+        "duration_s": vid_meta.get("duration_s"),
+    }
+    finalized = await _finalize_media(final_dest, reg_meta)
+    if not finalized:
+        logger.error("_send_and_poll_flux: media finalize (hash/sidecar/register) failed")
+        return str(final_dest)  # keep the file even if registration failed
+    return finalized
 
 
 # ─── 3. Grind session (thread driver) ──────────────────────────────────────────

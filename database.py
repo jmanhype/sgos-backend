@@ -121,6 +121,35 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_posts_zscore ON posts(z_score DESC);
         CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_posts_ingested ON posts(ingested_at DESC);
+
+        -- Production catalog (content factory outputs)
+        CREATE TABLE IF NOT EXISTS productions (
+            id TEXT PRIMARY KEY,
+            style_id TEXT NOT NULL,
+            franchise TEXT NOT NULL,
+            premise TEXT,
+            niche TEXT,
+            engine TEXT NOT NULL,
+            qc_status TEXT,
+            failure_reason TEXT,
+            seed INTEGER,
+            duration_s REAL,
+            resolution TEXT,
+            file_path TEXT,
+            file_size INTEGER,
+            file_hash TEXT,
+            prompt TEXT,
+            render_duration_s REAL,
+            generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(engine, file_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_prod_generated ON productions(generated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_prod_engine ON productions(engine);
+        CREATE INDEX IF NOT EXISTS idx_prod_style ON productions(style_id);
+        CREATE INDEX IF NOT EXISTS idx_prod_franchise ON productions(franchise);
+        -- Dedup: same file content (hash) from same engine should not be registered twice.
+        -- Created as unique index (not inline UNIQUE) so it works on pre-existing tables.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_prod_engine_hash ON productions(engine, file_hash) WHERE file_hash IS NOT NULL;
     """)
 
     # Create FTS5 virtual table if not exists
