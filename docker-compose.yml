@@ -1,0 +1,35 @@
+# SGOS Backend — standalone service definition.
+#
+# Containerizes the H3 pipeline (lib/h3_pipeline.py + routers/h3.py) which talks
+# to the 3090 GPU server over SSH/SCP. Run it as part of the VBL compose stack:
+#
+#   docker compose -f ../viral-bench-local/docker-compose.yml \
+#                  -f ./docker-compose.yml up -d sgos-backend
+#
+# Or merge this `sgos-backend` block into the VBL root compose file.
+services:
+  sgos-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      # Expose only on loopback — the API has an optional bearer token (SGOS_API_KEY).
+      - "127.0.0.1:8420:8420"
+    volumes:
+      # SSH keys + known_hosts for the H3 pipeline — read-only, secrets stay out
+      # of the image. Requires ~/.ssh/known_hosts to contain the 3090 host key.
+      - "${HOME}/.ssh:/root/.ssh:ro"
+    environment:
+      # ── H3 pipeline: talk to the 3090 box ───────────────
+      H3_GPU_HOST: ${H3_GPU_HOST:-192.168.1.143}
+      H3_GPU_USER: ${H3_GPU_USER:-straughter}
+      H3_REMOTE_HOME: ${H3_REMOTE_HOME:-/home/straughter/Wan2GP}
+      # ── Optional app auth (leave empty for no auth, like dev) ──
+      SGOS_API_KEY: ${SGOS_API_KEY:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8420/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
