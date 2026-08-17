@@ -26,7 +26,6 @@ DEFAULT_USER = os.environ.get("H3_GPU_USER", "straughter")
 # Where wgp.py lives on the box, and where outputs land.
 _h3_home = os.environ.get("H3_REMOTE_HOME", f"/home/{DEFAULT_USER}/Wan2GP")
 REMOTE_RUN_DIR = _h3_home
-REMOTE_JOBS_DIR = f"{_h3_home}/jobs"
 REMOTE_OUTPUTS_DIR = f"{_h3_home}/outputs"
 
 # Constants matching the runner/workflow (kept here so routers/lib agree).
@@ -94,7 +93,9 @@ def submit_h3_job(
         json.dump(job_json, tf, ensure_ascii=False, indent=2)
         tf.write("\n")
 
-    remote_job = f"{REMOTE_JOBS_DIR}/{job_id}.json"
+    # Job files are placed directly in the Wan2GP run dir next to wgp.py
+    # (matches the manual workflow — see the batch_*.json files on the box).
+    remote_job = f"{REMOTE_RUN_DIR}/{job_id}.json"
 
     try:
         # 1) SCP the job file up.
