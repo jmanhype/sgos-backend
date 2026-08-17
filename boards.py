@@ -50,7 +50,6 @@ def init_board_tables():
     """)
 
     conn.commit()
-    conn.close()
 
 
 def create_board(name: str, description: str = "", color: str = "#00ff88") -> dict:
@@ -63,10 +62,8 @@ def create_board(name: str, description: str = "", color: str = "#00ff88") -> di
         )
         conn.commit()
         row = conn.execute("SELECT * FROM boards WHERE name=?", (name,)).fetchone()
-        conn.close()
         return dict(row) if row else {"error": "Failed to create board"}
     except sqlite3.IntegrityError:
-        conn.close()
         return {"error": f"Board '{name}' already exists"}
 
 
@@ -80,7 +77,6 @@ def list_boards() -> list[dict]:
         GROUP BY b.id
         ORDER BY b.updated_at DESC
     """).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -89,14 +85,12 @@ def get_board(board_id: int) -> dict | None:
     conn = get_connection()
     board = conn.execute("SELECT * FROM boards WHERE id=?", (board_id,)).fetchone()
     if not board:
-        conn.close()
         return None
 
     posts = conn.execute("""
         SELECT * FROM board_posts WHERE board_id=? ORDER BY saved_at DESC
     """, (board_id,)).fetchall()
 
-    conn.close()
     return {
         **dict(board),
         "posts": [dict(p) for p in posts],
@@ -109,7 +103,6 @@ def delete_board(board_id: int) -> bool:
     conn.execute("DELETE FROM board_posts WHERE board_id=?", (board_id,))
     conn.execute("DELETE FROM boards WHERE id=?", (board_id,))
     conn.commit()
-    conn.close()
     return True
 
 
@@ -139,10 +132,8 @@ def save_post_to_board(board_id: int, post: dict, note: str = "") -> dict:
         ))
         conn.execute("UPDATE boards SET updated_at=datetime('now') WHERE id=?", (board_id,))
         conn.commit()
-        conn.close()
         return {"status": "saved", "board_id": board_id, "post_id": post_id}
     except Exception as e:
-        conn.close()
         return {"error": str(e)}
 
 
@@ -151,7 +142,6 @@ def remove_post_from_board(board_id: int, post_id: str) -> bool:
     conn = get_connection()
     conn.execute("DELETE FROM board_posts WHERE board_id=? AND post_id=?", (board_id, post_id))
     conn.commit()
-    conn.close()
     return True
 
 

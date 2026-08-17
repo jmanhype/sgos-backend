@@ -51,7 +51,6 @@ def init_voice_tables():
     """)
 
     conn.commit()
-    conn.close()
 
 
 def analyze_text(text: str) -> dict:
@@ -170,8 +169,14 @@ def build_voice_profile(name: str, texts: list[dict], description: str = "") -> 
     conn = get_connection()
 
     if not texts:
-        conn.close()
         return {"error": "No texts provided"}
+
+    # Insert placeholder profile FIRST so FK constraint passes for samples
+    conn.execute(
+        "INSERT OR IGNORE INTO voice_profiles (name, description, sample_count, common_words, punctuation_style, tone_markers, hook_patterns, closing_patterns, formatting_prefs) VALUES (?, ?, 0, '[]', '{}', '{}', '{}', '{}', '{}')",
+        (name, description)
+    )
+    conn.commit()
 
     # Analyze each sample
     analyses = []
@@ -189,7 +194,6 @@ def build_voice_profile(name: str, texts: list[dict], description: str = "") -> 
         )
 
     if not analyses:
-        conn.close()
         return {"error": "No valid texts to analyze"}
 
     # Aggregate metrics
@@ -277,7 +281,6 @@ def build_voice_profile(name: str, texts: list[dict], description: str = "") -> 
     ))
 
     conn.commit()
-    conn.close()
 
     return profile
 
@@ -287,7 +290,6 @@ def get_voice_profile(name: str) -> dict | None:
     init_voice_tables()
     conn = get_connection()
     row = conn.execute("SELECT * FROM voice_profiles WHERE name=?", (name,)).fetchone()
-    conn.close()
 
     if not row:
         return None
@@ -375,7 +377,6 @@ def list_profiles() -> list[dict]:
     init_voice_tables()
     conn = get_connection()
     rows = conn.execute("SELECT name, description, sample_count, updated_at FROM voice_profiles ORDER BY updated_at DESC").fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 

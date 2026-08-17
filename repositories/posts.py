@@ -76,7 +76,6 @@ class PostRepository:
             query = query.replace("FROM posts", "FROM posts WHERE platform = ?")
             params.insert(0, platform)
         rows = conn.execute(query, params).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
 
 

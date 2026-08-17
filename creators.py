@@ -80,7 +80,6 @@ def init_creator_tables():
     """)
 
     conn.commit()
-    conn.close()
 
 
 def add_creator(handle: str, platform: str, display_name: str = "", niche: str = "", tags: list[str] = None) -> dict:
@@ -99,10 +98,8 @@ def add_creator(handle: str, platform: str, display_name: str = "", niche: str =
             "SELECT * FROM creators WHERE handle=? AND platform=?",
             (handle, platform)
         ).fetchone()
-        conn.close()
         return dict(row) if row else {"error": "Failed to add creator"}
     except Exception as e:
-        conn.close()
         return {"error": str(e)}
 
 
@@ -112,7 +109,6 @@ def remove_creator(handle: str, platform: str) -> bool:
     conn = get_connection()
     conn.execute("UPDATE creators SET is_active=0 WHERE handle=? AND platform=?", (handle, platform))
     conn.commit()
-    conn.close()
     return True
 
 
@@ -133,7 +129,6 @@ def list_creators(platform: str = None, niche: str = None) -> list[dict]:
 
     query += " GROUP BY c.id ORDER BY c.created_at DESC"
     rows = conn.execute(query, params).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -169,7 +164,6 @@ def add_creator_post(creator_id: int, post_data: dict) -> dict:
             "SELECT * FROM creator_posts WHERE creator_id=? AND platform_post_id=?",
             (creator_id, post_data.get('platform_post_id', ''))
         ).fetchone()
-        conn.close()
 
         result = dict(row) if row else {"error": "Failed to add post"}
 
@@ -179,7 +173,6 @@ def add_creator_post(creator_id: int, post_data: dict) -> dict:
 
         return result
     except Exception as e:
-        conn.close()
         return {"error": str(e)}
 
 
@@ -194,7 +187,6 @@ def get_creator_posts(creator_id: int = None, handle: str = None, limit: int = 2
         if creator:
             creator_id = creator['id']
         else:
-            conn.close()
             return []
 
     query = """
@@ -215,7 +207,6 @@ def get_creator_posts(creator_id: int = None, handle: str = None, limit: int = 2
     params.append(limit)
 
     rows = conn.execute(query, params).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -227,7 +218,6 @@ def create_alert(creator_id: int, post_id: int, alert_type: str, message: str):
         (creator_id, post_id, alert_type, message)
     )
     conn.commit()
-    conn.close()
 
 
 def get_alerts(unread_only: bool = True, limit: int = 20) -> list[dict]:
@@ -251,7 +241,6 @@ def get_alerts(unread_only: bool = True, limit: int = 20) -> list[dict]:
     params.append(limit)
 
     rows = conn.execute(query, params).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -260,7 +249,6 @@ def mark_alert_read(alert_id: int):
     conn = get_connection()
     conn.execute("UPDATE creator_alerts SET is_read=1 WHERE id=?", (alert_id,))
     conn.commit()
-    conn.close()
 
 
 def get_creator_stats(creator_id: int = None) -> dict:
@@ -280,7 +268,6 @@ def get_creator_stats(creator_id: int = None) -> dict:
             FROM creators c
             WHERE c.id = ?
         """, (creator_id,)).fetchone()
-        conn.close()
         return dict(row) if row else {}
     else:
         rows = conn.execute("""
@@ -294,7 +281,6 @@ def get_creator_stats(creator_id: int = None) -> dict:
             WHERE c.is_active = 1
             ORDER BY outlier_count DESC
         """).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
 
 

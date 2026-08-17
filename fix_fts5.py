@@ -1,10 +1,7 @@
 """Fix corrupted FTS5 index by rebuilding from scratch."""
-import sqlite3
-from pathlib import Path
+from database import get_connection
 
-DB_PATH = Path(__file__).parent / "sgos.db"
-
-conn = sqlite3.connect(str(DB_PATH))
+conn = get_connection()
 conn.execute("PRAGMA journal_mode=WAL")
 
 print("Dropping corrupted FTS5...")
@@ -38,5 +35,4 @@ print(f"'grok' matches: {len(rows2)}")
 for r in rows2:
     print(f"  {r[0][:70]}")
 
-conn.close()
 print("\n✅ FTS5 rebuilt successfully!")

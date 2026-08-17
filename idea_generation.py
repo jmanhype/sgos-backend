@@ -7,9 +7,7 @@ Uses Perplexity API (OpenAI-compatible) for research-aware generation.
 """
 import os
 import json
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 
 try:
     from openai import OpenAI
@@ -20,26 +18,32 @@ except ImportError:
 from database import get_outliers, get_trending_topics, get_stats, get_connection
 from voice_profile import get_voice_profile, generate_voice_prompt, init_voice_tables
 
-DB_PATH = Path(__file__).parent / "sgos.db"
-
 # ─── LLM Configuration ────────────────────────────────────────────────────────
 
 def _get_client():
-    """Get OpenAI-compatible client. Priority: env vars > Aliyun (from Hermes config)."""
+    """Get OpenAI-compatible client. Priority: SGOS_LLM_* (from .env) > Perplexity > OpenAI > custom > Hermes config."""
     if not HAS_OPENAI:
         return None, None
     
-    # Check env vars first
+    # ── 1. SGOS-specific config (from .env — always check first) ──────────
+    sgos_url = os.environ.get("SGOS_LLM_BASE_URL")
+    sgos_key = os.environ.get("SGOS_LLM_API_KEY")
+    sgos_model = os.environ.get("SGOS_LLM_MODEL")
+    if sgos_url and sgos_key:
+        return (
+            OpenAI(api_key=sgos_key, base_url=sgos_url, max_retries=5, timeout=60),
+            sgos_model or "qwen-latest-series-invite-beta-v34",
+        )
+    
+    # ── 2. Perplexity (check if it works — may be out of quota) ──────────
     perplexity_key = os.environ.get("PERPLEXITY_API_KEY")
     openai_key = os.environ.get("OPENAI_API_KEY")
     custom_url = os.environ.get("LLM_BASE_URL")
     custom_key = os.environ.get("LLM_API_KEY")
     
-    # Try Perplexity (check if it works — may be out of quota)
     if perplexity_key:
         try:
             client = OpenAI(api_key=perplexity_key, base_url="https://api.perplexity.ai", max_retries=5, timeout=60)
-            # Quick check — if quota exceeded, fall through
             return client, "sonar"
         except Exception:
             pass
@@ -125,7 +129,6 @@ def generate_ideas(
                 "SELECT content FROM voice_references WHERE profile_name=? AND source='skill_md' ORDER BY created_at DESC LIMIT 1",
                 (voice_name,)
             ).fetchone()
-            conn.close()
             if ref:
                 # The full skill content IS the voice system prompt — much better than statistical summary
                 voice_prompt = f"## VOICE PROFILE (use this style for ALL output):\n\n{ref['content'][:6000]}"
@@ -197,7 +200,7 @@ Return as JSON array with keys: hook, angle, format, why_it_works, brief (array)
                 ],
                 temperature=0.8,
                 max_tokens=2000,
-                response_format={"type": "json_object"} if "sonar" in (model or "") else None,
+                extra_body={"enable_thinking": True},
             )
             
             content = response.choices[0].message.content
@@ -322,6 +325,7 @@ Each value should be the full text for that format."""
                 ],
                 temperature=0.7,
                 max_tokens=3000,
+                extra_body={"enable_thinking": True},
             )
             
             content = response.choices[0].message.content
@@ -377,7 +381,6 @@ def init_ideas_table():
         )
     """)
     conn.commit()
-    conn.close()
 
 
 def save_ideas(ideas_result: dict, topic: str = None) -> int:
@@ -405,7 +408,6 @@ def save_ideas(ideas_result: dict, topic: str = None) -> int:
             ))
             saved += 1
     conn.commit()
-    conn.close()
     return saved
 
 
@@ -426,7 +428,6 @@ def get_saved_ideas(limit: int = 20, status: str = "draft", topic: str = None) -
     params.append(limit)
     
     rows = conn.execute(query, params).fetchall()
-    conn.close()
     
     ideas = []
     for row in rows:

@@ -88,7 +88,6 @@ def train():
         texts,
         description="Straughter Guthrie — AI Distillation Architect, systems engineer, agent infrastructure builder. Direct, technical, implementation-first voice."
     )
-    conn.close()
 
     print(f"  ✅ Profile trained: {profile.get('sample_count', 0)} samples")
     print(f"     Avg word count: {profile.get('avg_word_count', 0):.0f}")
@@ -122,7 +121,6 @@ def train():
                 ("straughterg", "skill_md", skill_text)
             )
         conn.commit()
-        conn.close()
         print(f"  ✅ Stored SKILL.md ({len(skill_text)} chars) as voice reference")
 
     print("\n🎯 Voice profile ready. Use voice='straughterg' in /ideas/generate")

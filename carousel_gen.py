@@ -311,7 +311,6 @@ def generate_carousel_with_llm(
                 "SELECT content FROM voice_references WHERE profile_name=? AND source='skill_md' ORDER BY created_at DESC LIMIT 1",
                 (voice_name,)
             ).fetchone()
-            conn.close()
             if ref:
                 voice_context = f"\n\nVOICE PROFILE (write in this style):\n{ref['content'][:3000]}"
         except Exception:
@@ -360,6 +359,7 @@ Write real, compelling copy — not placeholders."""
             ],
             temperature=0.8,
             max_tokens=2500,
+            extra_body={"enable_thinking": True},
         )
         
         content_text = response.choices[0].message.content

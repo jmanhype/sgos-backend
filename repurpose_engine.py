@@ -104,7 +104,7 @@ Slide 8: CTA + "Follow for more"
                 ],
                 temperature=0.8,
                 max_tokens=6000,
-                timeout=60,
+                extra_body={"enable_thinking": True},
             )
 
             raw_output = response.choices[0].message.content
