@@ -29,7 +29,7 @@ REMOTE_RUN_DIR = _h3_home
 REMOTE_OUTPUTS_DIR = f"{_h3_home}/outputs"
 
 # Constants matching the runner/workflow (kept here so routers/lib agree).
-WGP_CMD = "./wgp.py"
+WGP_CMD = "source venv/bin/activate && PYTHONUNBUFFERED=1 PYTORCH_ALLOC_CONF=expandable_segments:True python3 wgp.py --process {job} --profile 3 --attention sdpa"
 
 # Strict identifier charset — blocks path traversal / shell metacharacters.
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]+$")
@@ -106,11 +106,13 @@ def submit_h3_job(
             )
 
         # 2) Launch wgp.py inside a named tmux session (detached).
-        #    `cd $REMOTE_RUN_DIR && tmux new-session -d -s <session> './wgp.py <job>'`.
+        #    Activates venv, sets unbuffered output + VRAM config, runs with --process/--profile/--attention.
+        job_file = _safe_identifier(job_id + '.json', 'job file')
+        cmd = WGP_CMD.format(job=job_file)
         launch = (
             f"cd {REMOTE_RUN_DIR} && "
             f"tmux new-session -d -s {_safe_identifier(session_name, 'session')} "
-            f"'{WGP_CMD} {_safe_identifier(job_id + '.json', 'job file')}'"
+            f"'{cmd} 2>&1 | tee /tmp/{job_file}.log'"
         )
         res = _ssh(user, host, launch, timeout=30)
         if res.returncode != 0:
