@@ -25,12 +25,7 @@ from typing import Any, Optional
 
 import httpx
 
-from lib.h3_pipeline import (
-    build_h3_config_with_fallback,
-    check_h3_status,
-    retrieve_h3_result,
-    submit_h3_job,
-)
+from lib.h3_pipeline import build_h3_config_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +34,8 @@ VBL_BRIEF_URL = os.environ.get(
     "VBL_BRIEF_URL", "http://127.0.0.1:8002/v1/agent/brief"
 )
 H3_BASE_URL = os.environ.get("H3_BASE_URL", "http://127.0.0.1:8420")
+# Host-side h3-bridge (HTTP) used by the container — containers can't SSH to LAN.
+H3_BRIDGE_URL = os.environ.get("H3_BRIDGE_URL", "http://host.docker.internal:8041")
 EGO_BRIDGE_URL = os.environ.get("EGO_BRIDGE_URL", "http://127.0.0.1:8040")
 
 # ─── Data assets ───────────────────────────────────────────────────────────────
@@ -283,46 +280,6 @@ def _convert_to_wgp_format(job: dict) -> dict:
     return out
 
 
-async def _submit_h3(brief: dict) -> str:
-    """Submit the H3 job (from h3_multishot_json, fallback h3_job_json).
-
-    Converts VBL's multishot format (shots array) to wgp.py format
-    (script with --- separators, model_type at top level).
-    """
-    # Unwrap: support both full response and inner brief dict
-    inner = brief.get("brief", brief)
-    pp = inner.get("production_prompts", {})
-    job = pp.get("h3_multishot_json") or pp.get("h3_job_json")
-    if not job:
-        logger.error("_submit_h3: no h3_multishot_json or h3_job_json in brief")
-        return ""
-
-    # Convert VBL multishot format to wgp.py format
-    wgp_job = _convert_to_wgp_format(job)
-    logger.info(f"_submit_h3: converted job has keys: {list(wgp_job.keys())}")
-
-    api_key = os.environ.get("SGOS_API_KEY", "")
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                f"{H3_BASE_URL}/v1/h3/generate",
-                json={"h3_job_json": wgp_job},
-                headers=headers,
-            )
-            r.raise_for_status()
-            data = r.json()
-            session = data.get("session_name", "")
-            if session:
-                logger.info(f"_submit_h3: submitted session {session}")
-            else:
-                logger.error(f"_submit_h3: no session_name in response: {data}")
-            return session
-    except Exception as exc:
-        logger.error(f"_submit_h3: failed to submit H3 job: {exc}")
-        return ""
-
-
 async def _send_flux3(brief: dict) -> bool:
     """Navigate ego-bridge to #gen-1 and send the Flux3 /t2v command."""
     inner = brief.get("brief", brief)
@@ -365,34 +322,6 @@ async def _send_flux3(brief: dict) -> bool:
     except Exception as exc:
         logger.error(f"_send_flux3: failed: {exc}")
         return False
-
-
-async def _poll_h3(session: str) -> Optional[str]:
-    """Poll H3 status until complete/failed; returns output_file or None."""
-    api_key = os.environ.get("SGOS_API_KEY", "")
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    deadline = time.time() + H3_POLL_SECONDS
-    async with httpx.AsyncClient(timeout=30) as client:
-        while time.time() < deadline:
-            try:
-                r = await client.get(
-                    f"{H3_BASE_URL}/v1/h3/status/{session}", headers=headers
-                )
-                data = r.json()
-            except Exception as exc:
-                logger.warning(f"_poll_h3: poll error for {session}: {exc}")
-                await asyncio.sleep(15)
-                continue
-            status = data.get("status")
-            if status == "complete":
-                logger.info(f"_poll_h3: session {session} complete")
-                return data.get("output_file")
-            if status == "failed":
-                logger.error(f"_poll_h3: session {session} failed: {data.get('error')}")
-                return None
-            await asyncio.sleep(15)
-    logger.error(f"_poll_h3: session {session} timed out after {H3_POLL_SECONDS}s")
-    return None
 
 
 # Flux3 result polling: poll each 15s for up to ~5 minutes (20 attempts).
@@ -524,33 +453,19 @@ async def run_production_cycle(config: dict) -> dict:
             "brief": brief_resp, "qc_status": qc_status}
 
 
-async def _poll_h3_direct(session: str) -> Optional[str]:
-    """Poll H3 status via direct Python function call (no HTTP)."""
-    deadline = time.time() + H3_POLL_SECONDS
-    while time.time() < deadline:
-        try:
-            data = await asyncio.to_thread(check_h3_status, session)
-        except Exception as exc:
-            logger.warning(f"_poll_h3_direct: check error for {session}: {exc}")
-            await asyncio.sleep(15)
-            continue
-        status = data.get("status")
-        if status == "complete":
-            logger.info(f"_poll_h3_direct: session {session} complete")
-            return data.get("output_file")
-        if status == "failed":
-            logger.error(f"_poll_h3_direct: session {session} failed: {data.get('error')}")
-            return None
-        progress = data.get("progress", 0)
-        logger.debug(f"_poll_h3_direct: {session} running at {progress:.0%}")
-        await asyncio.sleep(15)
-    logger.error(f"_poll_h3_direct: session {session} timed out after {H3_POLL_SECONDS}s")
-    return None
+# H3 status polling cadence over the bridge (submit -> status every 15s).
+H3_POLL_INTERVAL = int(os.environ.get("H3_POLL_INTERVAL", "15"))
 
 
 async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
-    """Submit H3 job and poll to completion via direct Python calls (no HTTP self-call)."""
-    # Extract job from brief
+    """Submit an H3 job via the host-side h3-bridge and poll/download over HTTP.
+
+    Uses H3_BRIDGE_URL (http://host.docker.internal:8041) instead of direct SSH
+    — containers can't reach LAN IPs, so all H3 ops go through the bridge:
+      POST /v1/h3/submit   {job_json}                 -> {session_name}
+      GET  /v1/h3/status/{session}                     -> {status,progress,output_file,error}
+      POST /v1/h3/retrieve {remote_filename,local_path}-> {local_path,size}
+    """
     inner = brief.get("brief", brief)
     pp = inner.get("production_prompts", {})
     raw_job = pp.get("h3_multishot_json") or pp.get("h3_job_json")
@@ -558,39 +473,89 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
         logger.error("_submit_and_poll_h3: no h3_multishot_json or h3_job_json in brief")
         return None
 
-    # Build complete WGP config (handles Ref2VA fallback, motion injection, etc.)
+    # Build the complete WGP config (Ref2VA fallback, motion injection, etc.).
     try:
-        wgp_job = build_h3_config_with_fallback(raw_job, keeper_metadata=None)
+        wgp_job = _convert_to_wgp_format(
+            build_h3_config_with_fallback(raw_job, keeper_metadata=None)
+        )
     except Exception as exc:
         logger.error(f"_submit_and_poll_h3: config build failed: {exc}")
         return None
 
-    # Submit directly via Python function (blocking SSH, run in thread)
-    try:
-        session_name = await asyncio.to_thread(submit_h3_job, wgp_job)
-        logger.info(f"_submit_and_poll_h3: submitted directly: {session_name}")
-    except Exception as exc:
-        logger.error(f"_submit_and_poll_h3: direct submit failed: {exc}")
-        return None
+    api_headers = {}
+    api_key = os.environ.get("SGOS_API_KEY", "")
+    if api_key:
+        api_headers["Authorization"] = f"Bearer {api_key}"
 
+    # 1) Submit via the bridge.
+    try:
+        async with httpx.AsyncClient(timeout=60, headers=api_headers) as client:
+            r = await client.post(
+                f"{H3_BRIDGE_URL}/v1/h3/submit", json={"job_json": wgp_job}
+            )
+            r.raise_for_status()
+            session_name = (r.json() or {}).get("session_name", "")
+        logger.info(f"_submit_and_poll_h3: bridge submit -> {session_name}")
+    except Exception as exc:
+        logger.error(f"_submit_and_poll_h3: bridge submit failed: {exc}")
+        return None
     if not session_name:
-        logger.error("_submit_and_poll_h3: submit returned empty session name")
+        logger.error("_submit_and_poll_h3: bridge submit returned empty session name")
         return None
 
-    # Poll via direct function call
-    output_file = await _poll_h3_direct(session_name)
-    if not output_file:
-        logger.error(f"_submit_and_poll_h3: poll returned no output for {session_name}")
-        return None
-
-    # Retrieve via direct function call
+    # 2) Poll status every H3_POLL_INTERVAL until complete/failed/timeout.
+    deadline = time.time() + H3_POLL_SECONDS
+    output_file: Optional[str] = None
     try:
-        dest = str(out_dir / os.path.basename(output_file))
-        result = await asyncio.to_thread(retrieve_h3_result, output_file, dest)
-        logger.info(f"_submit_and_poll_h3: retrieved to {dest}")
-        return result
+        async with httpx.AsyncClient(timeout=30, headers=api_headers) as client:
+            while time.time() < deadline:
+                try:
+                    rr = await client.get(f"{H3_BRIDGE_URL}/v1/h3/status/{session_name}")
+                    rr.raise_for_status()
+                    data = rr.json() or {}
+                except Exception as exc:
+                    logger.warning(f"_submit_and_poll_h3: status poll error for {session_name}: {exc}")
+                    await asyncio.sleep(H3_POLL_INTERVAL)
+                    continue
+                status = data.get("status")
+                progress = data.get("progress", 0)
+                logger.info(
+                    f"_submit_and_poll_h3: {session_name} status={status} progress={progress}"
+                )
+                if status == "complete":
+                    output_file = data.get("output_file")
+                    logger.info(f"_submit_and_poll_h3: {session_name} complete, output={output_file}")
+                    break
+                if status == "failed":
+                    logger.error(
+                        f"_submit_and_poll_h3: {session_name} failed: {data.get('error')}"
+                    )
+                    return None
+                await asyncio.sleep(H3_POLL_INTERVAL)
     except Exception as exc:
-        logger.error(f"_submit_and_poll_h3: retrieve failed: {exc}")
+        logger.error(f"_submit_and_poll_h3: status polling broke: {exc}")
+        return None
+
+    if not output_file:
+        logger.error(f"_submit_and_poll_h3: no output_file after timeout for {session_name}")
+        return None
+
+    # 3) Retrieve via the bridge (HTTP download to local_path).
+    dest = str(out_dir / os.path.basename(output_file))
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        async with httpx.AsyncClient(timeout=300, headers=api_headers) as client:
+            r = await client.post(
+                f"{H3_BRIDGE_URL}/v1/h3/retrieve",
+                json={"remote_filename": output_file, "local_path": dest},
+            )
+            r.raise_for_status()
+            data = r.json() or {}
+        logger.info(f"_submit_and_poll_h3: bridge retrieve -> {data}")
+        # Trust the bridge's local_path if returned, else our dest.
+        return data.get("local_path") or dest
+    except Exception as exc:
+        logger.error(f"_submit_and_poll_h3: bridge retrieve failed: {exc}")
         return None
 
 
