@@ -36,6 +36,7 @@ from routers import replies
 from routers import projects
 from routers import style_guide
 from routers import vbl
+from routers import keepers as keepers_router
 
 
 def validate_binding_safety(cfg=None):
@@ -215,6 +216,7 @@ app.include_router(strikes.router)
 app.include_router(projects.router)
 app.include_router(style_guide.router)
 app.include_router(vbl.router)
+app.include_router(keepers_router.router)
 
 
 if __name__ == "__main__":
