@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import threading
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # ─── Endpoints (override via env) ─────────────────────────────────────────────
 VBL_BRIEF_URL = os.environ.get(
@@ -229,67 +232,152 @@ async def _get_brief(pick: dict) -> dict:
         return r.json()
 
 
+def _convert_to_wgp_format(job: dict) -> dict:
+    """Convert VBL's h3_multishot_json to wgp.py-compatible format.
+
+    VBL format: {shots: [{prompt, ...}, ...], frames_per_shot, ...}
+    wgp.py format: {model_type, prompt, script: "shot1\\n---\\nshot2", frames_per_shot, ...}
+    """
+    shots = job.get("shots")
+    if not isinstance(shots, list) or not shots:
+        # Already in single-shot or wgp format — just ensure model_type exists
+        out = dict(job)
+        out.setdefault("model_type", "minimax_h3_fl2va_pruned")
+        out.setdefault("prompt", "factory-generated")
+        out.setdefault("force_fps", "24")
+        return out
+
+    # Build script from shots with --- separators
+    script_parts = []
+    for shot in shots:
+        prompt = shot.get("prompt", "")
+        motion = shot.get("motion_prompt", "")
+        combined = f"{prompt}, {motion}" if motion else prompt
+        script_parts.append(combined)
+
+    script = "\n---\n".join(script_parts)
+
+    # Build wgp.py-compatible config
+    out = {
+        "model_type": job.get("model_type", "minimax_h3_fl2va_pruned"),
+        "prompt": "multishot",
+        "script": script,
+        "width": job.get("width", 480),
+        "height": job.get("height", 832),
+        "frames_per_shot": job.get("frames_per_shot", 176),
+        "num_inference_steps": job.get("num_inference_steps", 20),
+        "guidance_scale": job.get("guidance_scale", 1.0),
+        "embedded_guidance_scale": job.get("embedded_guidance_scale", 6.0),
+        "force_fps": str(job.get("force_fps", "24")),
+        "seed": job.get("seed", 42),
+    }
+    return out
+
+
 async def _submit_h3(brief: dict) -> str:
-    """Submit the H3 job (from h3_multishot_json, fallback h3_job_json)."""
-    job = brief.get("brief", {}).get("h3_multishot_json") or brief.get("brief", {}).get("h3_job_json")
+    """Submit the H3 job (from h3_multishot_json, fallback h3_job_json).
+
+    Converts VBL's multishot format (shots array) to wgp.py format
+    (script with --- separators, model_type at top level).
+    """
+    # Unwrap: support both full response and inner brief dict
+    inner = brief.get("brief", brief)
+    pp = inner.get("production_prompts", {})
+    job = pp.get("h3_multishot_json") or pp.get("h3_job_json")
     if not job:
+        logger.error("_submit_h3: no h3_multishot_json or h3_job_json in brief")
         return ""
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            f"{H3_BASE_URL}/v1/h3/generate", json={"h3_job_json": job}
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data.get("session_name", "")
+
+    # Convert VBL multishot format to wgp.py format
+    wgp_job = _convert_to_wgp_format(job)
+    logger.info(f"_submit_h3: converted job has keys: {list(wgp_job.keys())}")
+
+    api_key = os.environ.get("SGOS_API_KEY", "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"{H3_BASE_URL}/v1/h3/generate",
+                json={"h3_job_json": wgp_job},
+                headers=headers,
+            )
+            r.raise_for_status()
+            data = r.json()
+            session = data.get("session_name", "")
+            if session:
+                logger.info(f"_submit_h3: submitted session {session}")
+            else:
+                logger.error(f"_submit_h3: no session_name in response: {data}")
+            return session
+    except Exception as exc:
+        logger.error(f"_submit_h3: failed to submit H3 job: {exc}")
+        return ""
 
 
 async def _send_flux3(brief: dict) -> bool:
     """Navigate ego-bridge to #gen-1 and send the Flux3 /t2v command."""
-    flux3_cmd = brief.get("brief", {}).get("flux3")
+    inner = brief.get("brief", brief)
+    pp = inner.get("production_prompts", {})
+    flux3_cmd = pp.get("flux3")
     if not flux3_cmd:
+        logger.error("_send_flux3: no flux3 prompt in brief production_prompts")
         return False
-    async with httpx.AsyncClient(timeout=60) as client:
-        await client.post(f"{EGO_BRIDGE_URL}/v1/navigate",
-                          json={"url": FLUX_GEN_CHANNEL, "wait": True, "timeout": 40})
-        # Find & focus the Discord message box, type, then press Enter.
-        js_focus = (
-            "(()=>{const e=[...document.querySelectorAll('div[contenteditable=true]')]"
-            ".find(x=>(x.getAttribute('aria-label')||'').startsWith('Message'));"
-            "if(e){e.focus(); return 'ok';} return 'no-input';})()"
-        )
-        r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js_focus})
-        if r.json().get("result") != "ok":
-            return False
-        await client.post(f"{EGO_BRIDGE_URL}/v1/type",
-                          json={"selector": '[aria-label="Message"]', "text": flux3_cmd})
-        enter_js = (
-            "(()=>{const e=[...document.querySelectorAll('div[contenteditable=true]')]"
-            ".find(x=>(x.getAttribute('aria-label')||'').startsWith('Message'));"
-            "if(!e) return false; e.focus();"
-            "const k=new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true});"
-            "return e.dispatchEvent(k);})()"
-        )
-        await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": enter_js})
-    return True
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            await client.post(f"{EGO_BRIDGE_URL}/v1/navigate",
+                              json={"url": FLUX_GEN_CHANNEL, "wait": True, "timeout": 40})
+            # Find & focus the Discord message box, type, then press Enter.
+            js_focus = (
+                "(()=>{const e=[...document.querySelectorAll('div[contenteditable=true]')]"
+                ".find(x=>(x.getAttribute('aria-label')||'').startsWith('Message'));"
+                "if(e){e.focus(); return 'ok';} return 'no-input';})()"
+            )
+            r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js_focus})
+            if r.json().get("result") != "ok":
+                logger.error("_send_flux3: could not focus Discord input")
+                return False
+            await client.post(f"{EGO_BRIDGE_URL}/v1/type",
+                              json={"selector": '[aria-label="Message"]', "text": flux3_cmd})
+            enter_js = (
+                "(()=>{const e=[...document.querySelectorAll('div[contenteditable=true]')]"
+                ".find(x=>(x.getAttribute('aria-label')||'').startsWith('Message'));"
+                "if(!e) return false; e.focus();"
+                "const k=new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true});"
+                "return e.dispatchEvent(k);})()"
+            )
+            await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": enter_js})
+        logger.info("_send_flux3: sent Flux3 command to Discord")
+        return True
+    except Exception as exc:
+        logger.error(f"_send_flux3: failed: {exc}")
+        return False
 
 
 async def _poll_h3(session: str) -> Optional[str]:
     """Poll H3 status until complete/failed; returns output_file or None."""
+    api_key = os.environ.get("SGOS_API_KEY", "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     deadline = time.time() + H3_POLL_SECONDS
     async with httpx.AsyncClient(timeout=30) as client:
         while time.time() < deadline:
             try:
-                r = await client.get(f"{H3_BASE_URL}/v1/h3/status/{session}")
+                r = await client.get(
+                    f"{H3_BASE_URL}/v1/h3/status/{session}", headers=headers
+                )
                 data = r.json()
-            except Exception:
+            except Exception as exc:
+                logger.warning(f"_poll_h3: poll error for {session}: {exc}")
                 await asyncio.sleep(15)
                 continue
             status = data.get("status")
             if status == "complete":
+                logger.info(f"_poll_h3: session {session} complete")
                 return data.get("output_file")
             if status == "failed":
+                logger.error(f"_poll_h3: session {session} failed: {data.get('error')}")
                 return None
             await asyncio.sleep(15)
+    logger.error(f"_poll_h3: session {session} timed out after {H3_POLL_SECONDS}s")
     return None
 
 
@@ -368,30 +456,40 @@ async def run_production_cycle(config: dict) -> dict:
 
 
 async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
-    session = await _submit_h3({"brief": brief})
+    session = await _submit_h3(brief)
     if not session:
+        logger.error("_submit_and_poll_h3: submit returned empty session")
         return None
     output = await _poll_h3(session)
     if not output:
+        logger.error(f"_submit_and_poll_h3: poll returned no output for {session}")
         return None
     try:
         from lib.h3_pipeline import retrieve_h3_result
         dest = out_dir / os.path.basename(output)
-        return await asyncio.to_thread(retrieve_h3_result, output, str(dest))
-    except Exception:
+        result = await asyncio.to_thread(retrieve_h3_result, output, str(dest))
+        logger.info(f"_submit_and_poll_h3: retrieved to {dest}")
+        return result
+    except Exception as exc:
+        logger.error(f"_submit_and_poll_h3: retrieve failed: {exc}")
         return None
 
 
 async def _send_and_poll_flux(brief: dict, out_dir: Path) -> Optional[str]:
     if not await _send_flux3(brief):
+        logger.error("_send_and_poll_flux: send failed")
         return None
     url = await _poll_flux3()
     if not url:
+        logger.error("_send_and_poll_flux: poll returned no URL")
         return None
     try:
         dest = out_dir / f"flux3_{int(time.time())}.mp4"
-        return await asyncio.to_thread(_download, url, dest)
-    except Exception:
+        result = await asyncio.to_thread(_download, url, dest)
+        logger.info(f"_send_and_poll_flux: downloaded to {dest}")
+        return result
+    except Exception as exc:
+        logger.error(f"_send_and_poll_flux: download failed: {exc}")
         return None
 
 
