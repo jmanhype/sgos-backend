@@ -24,6 +24,22 @@ PRODUCTIONS_ROOT = Path(
     os.environ.get("PRODUCTIONS_ROOT", str(Path.home() / "sgos-productions"))
 ).resolve()
 
+# Host-side path for bridge calls (bridges run on host, not in container).
+# When running in Docker, PRODUCTIONS_ROOT=/productions but bridges need
+# the actual host path. Set HOST_PRODUCTIONS_ROOT env var to match.
+HOST_PRODUCTIONS_ROOT = Path(
+    os.environ.get("HOST_PRODUCTIONS_ROOT", str(PRODUCTIONS_ROOT))
+).resolve()
+
+
+def to_host_path(container_path: Path) -> str:
+    """Convert a container-local production path to a host path for bridge calls."""
+    try:
+        relative = container_path.relative_to(PRODUCTIONS_ROOT)
+        return str(HOST_PRODUCTIONS_ROOT / relative)
+    except ValueError:
+        return str(container_path)
+
 
 def validate_path_within_root(path: Path) -> Path:
     """R1: Validate that a resolved path is within PRODUCTIONS_ROOT.

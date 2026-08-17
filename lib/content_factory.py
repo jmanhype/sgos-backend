@@ -27,6 +27,7 @@ import httpx
 
 from lib.h3_pipeline import build_h3_config_with_fallback
 from lib.production_store import (
+    to_host_path,
     PRODUCTIONS_ROOT,
     check_disk_quota,
     compute_file_hash,
@@ -687,7 +688,7 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path, provenance: Optional[d
         async with httpx.AsyncClient(timeout=300, headers=api_headers) as client:
             r = await client.post(
                 f"{H3_BRIDGE_URL}/v1/h3/retrieve",
-                json={"remote_filename": output_file, "local_path": str(part_dest)},
+                json={"remote_filename": output_file, "local_path": to_host_path(part_dest)},
             )
             r.raise_for_status()
             data = r.json() or {}
@@ -782,7 +783,7 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[d
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(
                 f"{EGO_BRIDGE_URL}/v1/download",
-                json={"url": url, "output_path": str(part_dest)},
+                json={"url": url, "output_path": to_host_path(part_dest)},
             )
             r.raise_for_status()
             data = r.json()
