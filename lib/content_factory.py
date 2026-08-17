@@ -25,6 +25,13 @@ from typing import Any, Optional
 
 import httpx
 
+from lib.h3_pipeline import (
+    build_h3_config_with_fallback,
+    check_h3_status,
+    retrieve_h3_result,
+    submit_h3_job,
+)
+
 logger = logging.getLogger(__name__)
 
 # ─── Endpoints (override via env) ─────────────────────────────────────────────
@@ -57,6 +64,8 @@ FLUX_GEN_CHANNEL = os.environ.get(
 
 # Cap how long we wait for one production (H3 or Flux3) before giving up.
 H3_POLL_SECONDS = int(os.environ.get("H3_POLL_SECONDS", "900"))
+# Disabled in favor of FLUX_POLL_INTERVAL/ATTEMPTS in _poll_flux3 above (kept
+# for backward env compatibility of the overall poll budget, not used):
 FLUX_POLL_SECONDS = int(os.environ.get("FLUX_POLL_SECONDS", "900"))
 
 # Output directory for downloaded results (local path writable by this process).
@@ -386,24 +395,72 @@ async def _poll_h3(session: str) -> Optional[str]:
     return None
 
 
-async def _poll_flux3() -> Optional[str]:
-    """Poll Discord for a result.mp4 CDN url (signed) rendered by the Flux bot."""
-    deadline = time.time() + FLUX_POLL_SECONDS
-    js = (
-        "(()=>{const u=[...document.querySelectorAll('video')]"
-        ".map(x=>(x.currentSrc||x.src||'')).find(s=>s.includes('cdn.discordapp.com')&&s.includes('.mp4'));"
-        "return u||'';})()"
+# Flux3 result polling: poll each 15s for up to ~5 minutes (20 attempts).
+FLUX_POLL_INTERVAL = int(os.environ.get("FLUX_POLL_INTERVAL", "15"))
+FLUX_POLL_ATTEMPTS = int(os.environ.get("FLUX_POLL_ATTEMPTS", "20"))
+
+
+def _cdn_js() -> str:
+    """JS to collect ALL Discord CDN mp4 sources from videos/sources in the page."""
+    return (
+        "(()=>{"
+        "const urls=new Set();"
+        "document.querySelectorAll('video source, video[src]').forEach(v=>{"
+        "const s=(v.currentSrc||v.src||'').split('?')[0];"
+        "if(s.includes('cdn.discordapp.com')&&s.includes('.mp4'))urls.add(s);"
+        "});"
+        "return JSON.stringify([...urls]);"
+        "})()"
+    )
+
+
+async def _collect_cdn_urls() -> set[str]:
+    """Return the current set of Discord CDN mp4 URLs visible in the page."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": _cdn_js()})
+            raw = (r.json().get("result") or "").strip()
+            urls = json.loads(raw) if raw.startswith("[") else []
+            return set(urls)
+    except Exception as exc:
+        logger.warning(f"_collect_cdn_urls: failed to read CDN urls: {exc}")
+        return set()
+
+
+async def _poll_flux3(seen_urls: Optional[set] = None) -> Optional[str]:
+    """Poll Discord for a NEW result.mp4 CDN url (the factory's own submission).
+
+    - Polls every FLUX_POLL_INTERVAL (15s) for up to ~5 minutes.
+    - Reads ALL video source urls (not just the first match).
+    - Skips URLs already present before this submission (`seen_urls`).
+    - Logs each attempt so Docker logs show exactly what's happening.
+    Returns the new full signed CDN URL, or None on timeout.
+    """
+    seen = set(seen_urls or set())
+    logger.info(
+        f"_poll_flux3: polling every {FLUX_POLL_INTERVAL}s, "
+        f"up to {FLUX_POLL_ATTEMPTS} attempts; baseline seen={len(seen)} urls"
     )
     async with httpx.AsyncClient(timeout=30) as client:
-        while time.time() < deadline:
+        for attempt in range(1, FLUX_POLL_ATTEMPTS + 1):
             try:
-                r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js})
-                url = (r.json().get("result") or "").strip()
-                if url.startswith("http"):
-                    return url
-            except Exception:
-                pass
-            await asyncio.sleep(20)
+                r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": _cdn_js()})
+                raw = (r.json().get("result") or "").strip()
+                urls = json.loads(raw) if raw.startswith("[") else []
+                new = [u for u in urls if u not in seen]
+                logger.info(
+                    f"_poll_flux3: attempt {attempt}/{FLUX_POLL_ATTEMPTS} "
+                    f"found {len(urls)} cdn urls, {len(new)} new"
+                )
+                if new:
+                    # Return the newest (last) new full URL with its signed token.
+                    full = new[-1]
+                    logger.info(f"_poll_flux3: detected new result: {full}")
+                    return full
+            except Exception as exc:
+                logger.warning(f"_poll_flux3: attempt {attempt} error: {exc}")
+            await asyncio.sleep(FLUX_POLL_INTERVAL)
+    logger.error(f"_poll_flux3: no new result after {FLUX_POLL_ATTEMPTS} attempts")
     return None
 
 
@@ -436,11 +493,18 @@ async def run_production_cycle(config: dict) -> dict:
     brief = brief_resp.get("brief") or {}
     out_dir = Path(config.get("output_dir", str(OUTPUT_DIR)))
 
-    # Kick off H3 + Flux3 concurrently.
+    # Kick off H3 + Flux3 concurrently (return_exceptions so one failure
+    # doesn't cancel the other).
     h3_task = asyncio.create_task(_submit_and_poll_h3(brief, out_dir))
     flux_task = asyncio.create_task(_send_and_poll_flux(brief, out_dir))
 
-    h3_video, flux3_video = await asyncio.gather(h3_task, flux_task)
+    results = await asyncio.gather(h3_task, flux_task, return_exceptions=True)
+    h3_video = results[0] if not isinstance(results[0], Exception) else None
+    flux3_video = results[1] if not isinstance(results[1], Exception) else None
+    if isinstance(results[0], Exception):
+        logger.error(f"run_production_cycle: H3 task raised: {results[0]}")
+    if isinstance(results[1], Exception):
+        logger.error(f"run_production_cycle: Flux3 task raised: {results[1]}")
 
     qc_status = "ok" if (h3_video or flux3_video) else "failed"
     entry = {
@@ -460,19 +524,69 @@ async def run_production_cycle(config: dict) -> dict:
             "brief": brief_resp, "qc_status": qc_status}
 
 
+async def _poll_h3_direct(session: str) -> Optional[str]:
+    """Poll H3 status via direct Python function call (no HTTP)."""
+    deadline = time.time() + H3_POLL_SECONDS
+    while time.time() < deadline:
+        try:
+            data = await asyncio.to_thread(check_h3_status, session)
+        except Exception as exc:
+            logger.warning(f"_poll_h3_direct: check error for {session}: {exc}")
+            await asyncio.sleep(15)
+            continue
+        status = data.get("status")
+        if status == "complete":
+            logger.info(f"_poll_h3_direct: session {session} complete")
+            return data.get("output_file")
+        if status == "failed":
+            logger.error(f"_poll_h3_direct: session {session} failed: {data.get('error')}")
+            return None
+        progress = data.get("progress", 0)
+        logger.debug(f"_poll_h3_direct: {session} running at {progress:.0%}")
+        await asyncio.sleep(15)
+    logger.error(f"_poll_h3_direct: session {session} timed out after {H3_POLL_SECONDS}s")
+    return None
+
+
 async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
-    session = await _submit_h3(brief)
-    if not session:
-        logger.error("_submit_and_poll_h3: submit returned empty session")
+    """Submit H3 job and poll to completion via direct Python calls (no HTTP self-call)."""
+    # Extract job from brief
+    inner = brief.get("brief", brief)
+    pp = inner.get("production_prompts", {})
+    raw_job = pp.get("h3_multishot_json") or pp.get("h3_job_json")
+    if not raw_job:
+        logger.error("_submit_and_poll_h3: no h3_multishot_json or h3_job_json in brief")
         return None
-    output = await _poll_h3(session)
-    if not output:
-        logger.error(f"_submit_and_poll_h3: poll returned no output for {session}")
-        return None
+
+    # Build complete WGP config (handles Ref2VA fallback, motion injection, etc.)
     try:
-        from lib.h3_pipeline import retrieve_h3_result
-        dest = out_dir / os.path.basename(output)
-        result = await asyncio.to_thread(retrieve_h3_result, output, str(dest))
+        wgp_job = build_h3_config_with_fallback(raw_job, keeper_metadata=None)
+    except Exception as exc:
+        logger.error(f"_submit_and_poll_h3: config build failed: {exc}")
+        return None
+
+    # Submit directly via Python function (blocking SSH, run in thread)
+    try:
+        session_name = await asyncio.to_thread(submit_h3_job, wgp_job)
+        logger.info(f"_submit_and_poll_h3: submitted directly: {session_name}")
+    except Exception as exc:
+        logger.error(f"_submit_and_poll_h3: direct submit failed: {exc}")
+        return None
+
+    if not session_name:
+        logger.error("_submit_and_poll_h3: submit returned empty session name")
+        return None
+
+    # Poll via direct function call
+    output_file = await _poll_h3_direct(session_name)
+    if not output_file:
+        logger.error(f"_submit_and_poll_h3: poll returned no output for {session_name}")
+        return None
+
+    # Retrieve via direct function call
+    try:
+        dest = str(out_dir / os.path.basename(output_file))
+        result = await asyncio.to_thread(retrieve_h3_result, output_file, dest)
         logger.info(f"_submit_and_poll_h3: retrieved to {dest}")
         return result
     except Exception as exc:
@@ -481,12 +595,31 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path) -> Optional[str]:
 
 
 async def _send_and_poll_flux(brief: dict, out_dir: Path) -> Optional[str]:
-    if not await _send_flux3(brief):
-        logger.error("_send_and_poll_flux: send failed")
+    """Send the Flux3 command, then poll for + download our result.
+
+    If the send raises or returns False, log exactly why and return None
+    immediately (don't waste a 5-minute poll on a command that never sent).
+    """
+    try:
+        sent = await _send_flux3(brief)
+    except Exception as exc:
+        logger.error(f"_send_and_poll_flux: _send_flux3 raised: {exc}")
         return None
-    url = await _poll_flux3()
+    if not sent:
+        logger.error("_send_and_poll_flux: send returned False (see _send_flux3 log)")
+        return None
+
+    # Baseline: URLs already on the channel right after our send. Our result
+    # will be a NEW cdn.mp4 not present here, so we can attribute it to us.
+    try:
+        seen = await _collect_cdn_urls()
+    except Exception as exc:
+        logger.warning(f"_send_and_poll_flux: baseline collection failed: {exc}")
+        seen = set()
+
+    url = await _poll_flux3(seen)
     if not url:
-        logger.error("_send_and_poll_flux: poll returned no URL")
+        logger.error("_send_and_poll_flux: poll returned no NEW URL")
         return None
     try:
         dest = out_dir / f"flux3_{int(time.time())}.mp4"
