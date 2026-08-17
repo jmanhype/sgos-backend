@@ -148,7 +148,8 @@ def _send_telegram_alert(opportunities: list[dict]) -> int:
 
     try:
         from alert_system import get_alert_config, _send_telegram
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError) as e:
+        print(f"[warn] Alert send error: {e}")
         return 0
 
     # Build message
@@ -174,5 +175,6 @@ def _send_telegram_alert(opportunities: list[dict]) -> int:
             return 0
         result = _send_telegram(message, config)
         return 1 if result.get("status") == "sent" else 0
-    except Exception:
+    except Exception as e:
+        print(f"[warn] Alert send error: {e}")
         return 0

@@ -10,3 +10,4 @@ tests/test_sgos.db
 .pytest_cache/
 *.db-shm
 *.db-wal
+event_log.jsonl

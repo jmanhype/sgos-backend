@@ -59,7 +59,7 @@ Your strengths:
         from idea_generation import _get_client
         client, model = _get_client()
         if client is None:
-            yield {"data": json.dumps({"error": "LLM not configured. Set SGOS_LLM_API_KEY.", "done": True})}
+            yield f"data: {json.dumps({'error': 'LLM not configured. Set SGOS_LLM_API_KEY.', 'done': True})}\n\n"
             return
 
         full_messages = [{"role": "system", "content": system_prompt}]
@@ -72,6 +72,7 @@ Your strengths:
             stream=True,
             temperature=temperature,
             max_tokens=2000,
+            extra_body={"enable_thinking": True},
         )
 
         for chunk in stream:

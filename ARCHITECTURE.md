@@ -1,1186 +1,662 @@
-# SGOS System Architecture
+# SGOS Auto-Repurpose System Architecture
 
-> StraughterG-OS — Creator Intelligence Platform
-> Last updated: June 2026
-
----
-
-## 1. System Overview
-
-SGOS is a **self-hosted creator intelligence platform** that ingests social media content, detects viral patterns, and generates platform-optimized content using LLMs. It serves a single user (the creator) with a focus on Twitter, LinkedIn, Instagram, TikTok, and newsletters.
-
-### Core Capabilities
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        SGOS Platform                                │
-├─────────────┬──────────────┬──────────────┬─────────────────────────┤
-│  Research   │   Content    │   Analytics  │     Workflow            │
-│  Engine     │   Engine     │   Layer      │     Tools               │
-├─────────────┼──────────────┼──────────────┼─────────────────────────┤
-│ Reddit      │ LLM Chat     │ Viral Score  │ Voice Profile           │
-│ Hacker News │ Threads      │ Z-Score      │ Creator Tracking        │
-│ YouTube     │ Articles     │ Outlier Det. │ Boards/Swipe Files      │
-│ Twitter     │ Carousels    │ Trend Detect │ Project Management      │
-│ Web Scrape  │ Repurposing  │ Alert System │ Transcription           │
-│ SearXNG     │ Idea Gen     │ TF-IDF Search│ Style Guide             │
-└─────────────┴──────────────┴──────────────┴─────────────────────────┘
-```
-
-### Current Metrics
-
-| Dimension | Value |
-|-----------|-------|
-| Backend LOC | ~6,700 (22 Python files) |
-| Frontend LOC | ~7,300 (21 TS/TSX files) |
-| API Endpoints | 40+ |
-| Data Store | SQLite + FTS5 |
-| External Deps | Aliyun LLM, Firecrawl, SearXNG, yt-dlp, Whisper |
-| Deployment | Local dev machine + 3090 GPU server |
+**Status:** Draft  
+**Last Updated:** 2026-07-06  
+**Author:** Hermes Agent  
+**Reviewers:** @StraughterG
 
 ---
 
-## 2. Current Architecture (As-Is)
+## Executive Summary
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Browser (localhost:3000)                │
-│                                                          │
-│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │ NavSide │  │  Chat    │  │ Workspc  │  │  Views   │ │
-│  │ bar     │  │  Panel   │  │ Sidebar  │  │ (×10)    │ │
-│  └─────────┘  └────┬─────┘  └──────────┘  └──────────┘ │
-│                    │                                     │
-│              ┌─────▼──────┐                              │
-│              │ page.tsx   │  ← God component (682 LOC)   │
-│              │ (all state)│    owns routing + 15+ states  │
-│              └─────┬──────┘                              │
-│                    │ fetch('/api/chat')                   │
-│              ┌─────▼──────┐                              │
-│              │ route.ts   │  ← LLM proxy + research      │
-│              └────────────┘                              │
-│                                                          │
-│  localStorage: sessions, settings, workspace state       │
-└──────────────────────────┬───────────────────────────────┘
-                           │ HTTP
-┌──────────────────────────▼───────────────────────────────┐
-│                  Backend (localhost:8420)                  │
-│                                                          │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │              main.py (1,164 LOC)                    │ │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐│ │
-│  │  │ 40+      │ │ Auth     │ │ CSRF     │ │ CORS   ││ │
-│  │  │ endpoints│ │ middleware│ │ middleware│ │        ││ │
-│  │  └──────────┘ └──────────┘ └──────────┘ └────────┘│ │
-│  └─────────────────────────────────────────────────────┘ │
-│         │           │           │           │             │
-│  ┌──────▼──┐  ┌─────▼───┐  ┌───▼────┐  ┌───▼──────┐    │
-│  │database │  │ingest    │  │voice   │  │search    │    │
-│  │.py      │  │modules   │  │profile │  │engines   │    │
-│  │(pool)   │  │(×5)      │  │.py     │  │(×3)      │    │
-│  └──────┬──┘  └──────────┘  └────────┘  └──────────┘    │
-│         │                                                │
-│  ┌──────▼──────────────────────────────────────────────┐ │
-│  │            SQLite + FTS5 (sgos.db)                  │ │
-│  │  posts | creators | boards | voice | vector | fts5  │ │
-│  └─────────────────────────────────────────────────────┘ │
-│                                                          │
-│  External (via SSH to 3090):                             │
-│  ┌────────────┐  ┌───────────┐  ┌──────────┐           │
-│  │ Firecrawl  │  │ SearXNG   │  │ Whisper  │           │
-│  │ :3002      │  │ :8888     │  │ (local)  │           │
-│  └────────────┘  └───────────┘  └──────────┘           │
-└──────────────────────────────────────────────────────────┘
-```
+The current `ecomchigga_repurpose.py` script works when everything goes right but fails silently at every layer. This document proposes a restructured architecture that separates concerns, adds observability, and handles failures gracefully.
 
-### Current Architecture Problems
+**Core Problem:** The system conflates scraping, generation, verification, and posting into a single monolithic script with no error boundaries or retry logic.
 
-| # | Problem | Impact | Severity |
-|---|---------|--------|----------|
-| A1 | **God component** — `page.tsx` owns 15+ useState hooks and all routing | Adding any feature requires modifying the root file | HIGH |
-| A2 | **God endpoint file** — `main.py` has 40+ route handlers in 1,164 lines | Merge conflicts, hard to navigate, no separation of concerns | HIGH |
-| A3 | **No service layer** — endpoints directly call database functions | Business logic mixed with HTTP concerns, hard to test | HIGH |
-| A4 | **Synchronous ingestion** — Reddit/HN/YouTube ingestion blocks the request | API timeouts on slow network, no retry, no progress tracking | MEDIUM |
-| A5 | **No structured logging** — print statements and no log levels | Can't diagnose production issues, no audit trail | MEDIUM |
-| A6 | **Client-only sessions** — localStorage means sessions don't survive device changes | No sync across devices, lost on cache clear | LOW (single-user) |
-| A7 | **No config layer** — env vars scattered, no validation at startup | Silent failures when config is wrong | MEDIUM |
-| A8 | **No API versioning** — breaking changes break the frontend | Frontend and backend are tightly coupled | LOW (co-deployed) |
+**Proposed Solution:** Modular pipeline with explicit stages, failure modes, and recovery strategies.
 
 ---
 
-## 3. Target Architecture
+## Current System (As-Is)
 
-### 3.1 Design Principles
-
-1. **Single-user, local-first** — No need for multi-tenant, cloud-scale infra. Optimize for developer experience.
-2. **Incremental migration** — Don't rewrite everything. Move endpoints one module at a time.
-3. **Convention over configuration** — Use FastAPI's built-in dependency injection for cross-cutting concerns.
-4. **Type safety end-to-end** — Pydantic models in backend → OpenAPI spec → TypeScript types in frontend.
-5. **Async where it matters** — Ingestion and LLM calls are I/O-bound. Use background tasks, not sync blocking.
-6. **SQLite is fine** — For single-user with WAL mode, SQLite handles 100K+ rows easily. Don't migrate to Postgres without a real reason.
-
-### 3.2 Target Architecture Diagram
-
+### Flow
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Frontend (Next.js 16)                          │
-│                                                                     │
-│  ┌──────────┐                                                       │
-│  │ Layout   │  ← NavSidebar (persistent)                           │
-│  │ Provider │                                                       │
-│  └────┬─────┘                                                       │
-│       │                                                             │
-│  ┌────▼──────────────────────────────────────────┐                  │
-│  │              State Management                  │                  │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────────┐  │                  │
-│  │  │ useChat  │ │ useSess- │ │ useWorkspace │  │                  │
-│  │  │ Store    │ │ ionStore │ │ Store        │  │                  │
-│  │  └──────────┘ └──────────┘ └──────────────┘  │                  │
-│  └───────────────────────────────────────────────┘                  │
-│       │                                                             │
-│  ┌────▼──────────────────────────────────────────┐                  │
-│  │              View Components                   │                  │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ │                  │
-│  │  │ Chat   │ │Research│ │ Search │ │Settings│ │                  │
-│  │  │ Panel  │ │ Feed   │ │ View   │ │ View   │ │                  │
-│  │  └────────┘ └────────┘ └────────┘ └────────┘ │                  │
-│  └───────────────────────────────────────────────┘                  │
-│       │                                                             │
-│  ┌────▼──────────────┐                                              │
-│  │  API Client Layer  │  ← Typed fetch wrapper, error handling     │
-│  │  (lib/api.ts)      │    retry logic, abort controllers           │
-│  └────────────────────┘                                              │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │ HTTP/JSON
-┌──────────────────────────▼──────────────────────────────────────────┐
-│                     Backend (FastAPI)                                │
-│                                                                     │
-│  ┌────────────────────────────────────────────────────────────┐     │
-│  │                   Middleware Stack                           │     │
-│  │  CORS → CSRF Origin Check → Auth (Bearer) → Rate Limit     │     │
-│  │  → Request ID → Structured Logger                           │     │
-│  └────────────────────────────────────────────────────────────┘     │
-│       │                                                             │
-│  ┌────▼──────────────────────────────────────────────────────┐      │
-│  │                    Router Layer                             │      │
-│  │  ┌──────────┐ ┌──────────┐ ┌────────┐ ┌───────────────┐  │      │
-│  │  │ research │ │ content  │ │ voice  │ │ ingestion     │  │      │
-│  │  │ _router  │ │ _router  │ │ _router│ │ _router       │  │      │
-│  │  └────┬─────┘ └────┬─────┘ └───┬────┘ └──────┬────────┘  │      │
-│  │       │            │           │              │           │      │
-│  │  ┌────▼─────┐ ┌────▼─────┐ ┌──▼───┐ ┌───────▼───────┐  │      │
-│  │  │ search   │ │ repurpose│ │creatr│ │ ideas         │  │      │
-│  │  │ _router  │ │ _router  │ │router│ │ _router       │  │      │
-│  │  └──────────┘ └──────────┘ └──────┘ └───────────────┘  │      │
-│  └───────────────────────────────────────────────────────────┘      │
-│       │                                                             │
-│  ┌────▼──────────────────────────────────────────────────────┐      │
-│  │                   Service Layer                            │      │
-│  │  ┌──────────────┐ ┌────────────┐ ┌──────────────────┐    │      │
-│  │  │ ResearchSvc  │ │ ContentSvc │ │ IngestionSvc     │    │      │
-│  │  │ (search,     │ │ (generate, │ │ (reddit, HN,     │    │      │
-│  │  │  outliers,   │ │  repurpose,│ │  YouTube, Twitter│    │      │
-│  │  │  trends)     │ │  score)    │ │  scrape, topics) │    │      │
-│  │  └──────────────┘ └────────────┘ └──────────────────┘    │      │
-│  │  ┌──────────────┐ ┌────────────┐ ┌──────────────────┐    │      │
-│  │  │ VoiceSvc     │ │ CreatorSvc │ │ AlertSvc         │    │      │
-│  │  │ (profile,    │ │ (track,    │ │ (outlier alerts, │    │      │
-│  │  │  train)      │ │  stats)    │ │  creator spikes) │    │      │
-│  │  └──────────────┘ └────────────┘ └──────────────────┘    │      │
-│  └───────────────────────────────────────────────────────────┘      │
-│       │                                                             │
-│  ┌────▼──────────────────────────────────────────────────────┐      │
-│  │                  Repository Layer                          │      │
-│  │  ┌────────────────────────────────────────────────────┐   │      │
-│  │  │ PostRepo │ BoardRepo │ CreatorRepo │ SessionRepo  │   │      │
-│  │  └────────────────────────────────────────────────────┘   │      │
-│  │  Thread-local SQLite connection pool (database.py)        │      │
-│  └───────────────────────────────────────────────────────────┘      │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────┐       │
-│  │              Background Task Queue (asyncio)              │       │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐    │       │
-│  │  │ IngestionJob │ │ AnalysisJob  │ │ ScrapeJob    │    │       │
-│  │  │ (Reddit/HN/  │ │ (Z-scores,   │ │ (Firecrawl   │    │       │
-│  │  │  YT/Twitter) │ │  vectors)    │ │  via 3090)   │    │       │
-│  │  └──────────────┘ └──────────────┘ └──────────────┘    │       │
-│  └──────────────────────────────────────────────────────────┘       │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────┐       │
-│  │              Config Layer (pydantic-settings)             │       │
-│  │  ┌────────────────────────────────────────────────────┐  │       │
-│  │  │ AppSettings │ DatabaseSettings │ LLMSettings      │  │       │
-│  │  │ SSHSettings │ FirecrawlSettings│ AlertSettings    │  │       │
-│  │  └────────────────────────────────────────────────────┘  │       │
-│  └──────────────────────────────────────────────────────────┘       │
-└─────────────────────────────────────────────────────────────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │  SQLite     │
-                    │  + FTS5     │
-                    │  (sgos.db)  │
-                    └─────────────┘
+[Single Script: ecomchigga_repurpose.py]
+  ├─ Scrape tweets (bird CLI)
+  ├─ Group threads (conversationId)
+  ├─ Fetch full threads (bird thread)
+  ├─ Score & pick top content
+  ├─ Extract topics (regex)
+  ├─ Search SearXNG (localhost:4004)
+  ├─ Search Firecrawl (localhost:3005)
+  ├─ Generate thread (LLM)
+  ├─ Verify grounding (LLM → JSON parse → fallback)
+  ├─ Post via ego-browser (CDP)
+  └─ Write rate limit file
 ```
 
-### 3.3 Backend Module Breakdown
+### Problems
+1. **No error boundaries** — CDP hang in posting blocks entire pipeline
+2. **No retry logic** — JSON parse failures get rubber-stamped
+3. **No observability** — Silent failures, no alerting
+4. **Tight coupling** — Scraping, generation, posting all in one script
+5. **No deduplication** — Same content posted repeatedly
+6. **CDP session management** — ego-browser hangs after 2-3 replies
+7. **Naive grounding** — Search queries like "month since since built"
+8. **Character counting** — LLM can't reliably count, no post-processing
 
-#### Router Layer (`routers/`)
+### Failure Modes (Current)
+| Stage | Failure | Result |
+|-------|---------|--------|
+| Scraping | bird CLI error | Silent, no tweets scraped |
+| Thread fetch | CDP hang | Script hangs forever |
+| Generation | LLM timeout | Silent failure |
+| Verification | JSON parse error | Fallback: 85/100 (rubber stamp) |
+| Posting | CDP hang | Partial thread posted, script hangs |
+| Rate limit | File locked | Race condition |
 
-Each router maps to a domain concern. FastAPI's `APIRouter` with tags enables automatic OpenAPI grouping.
+---
 
-| Router | Current Endpoints | LOC | Responsibility |
-|--------|-------------------|-----|----------------|
-| `research.py` | `/outliers`, `/trends`, `/brief`, `/stats` | ~120 | Trend detection, outlier listing, daily brief |
-| `search.py` | `/search`, `/search/hybrid`, `/search/similar`, `/search/related`, `/search/build-index` | ~100 | FTS5 + TF-IDF hybrid search |
-| `content.py` | `/repurpose`, `/repurpose/ai`, `/ideas/generate`, `/ideas` | ~150 | LLM-powered content generation |
-| `ingestion.py` | `/ingest`, `/ingest/sync`, `/ingest/posts`, `/ingest/youtube`, `/ingest/topics` | ~120 | Data pipeline triggers |
-| `voice.py` | `/voice/build`, `/voice/build-from-text`, `/voice/{name}`, `/voice/{name}/prompt`, `/voices` | ~80 | Voice profile management |
-| `creators.py` | `/creators/follow`, `/creators/unfollow`, `/creators`, `/creators/{handle}/posts`, `/creators/stats` | ~80 | Creator tracking |
-| `boards.py` | `/boards`, `/boards/{id}`, `/boards/{id}/posts` | ~80 | Swipe file management |
-| `alerts.py` | `/alerts`, `/alerts/{id}/read`, `/alerts/outliers/check`, `/alerts/history` | ~80 | Alert system |
-| `media.py` | `/transcribe/file`, `/transcribe/url` | ~60 | Audio/video transcription |
-| `analytics.py` | `/analyze` | ~30 | Viral analysis |
+## Proposed Architecture (To-Be)
 
-#### Service Layer (`services/`)
+### High-Level Design
 
-Pure business logic. No HTTP concerns. Receives typed inputs, returns typed outputs.
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Scheduler (cron/cronjob)                   │
+│                   Triggers: daily 10:00 AM                    │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Orchestrator (Python)                      │
+│  - Coordinates stages                                         │
+│  - Handles retries/timeouts                                   │
+│  - Writes audit log                                           │
+│  - Sends alerts on failure                                    │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+   [Scraping]      [Generation]      [Posting]
+   (Stage 1)       (Stage 2)         (Stage 3)
+```
 
+### Stage 1: Content Scraping
+**Responsibility:** Fetch tweets from target accounts, detect threads, fetch full content.
+
+**Inputs:**
+- Target handles list (`TARGET_HANDLES`)
+- Max tweets per account (`MAX_TWEETS_TO_SCRAPE`)
+- Posted content registry (SQLite)
+
+**Outputs:**
+- List of candidate threads/posts
+- Metadata (engagement, timestamps, char count)
+
+**Failure Handling:**
+- bird CLI error → retry 3x with 10s backoff
+- CDP hang → kill subprocess, retry with fresh session
+- No content found → skip account, continue
+
+**Key Decisions:**
+1. **SQLite registry** for deduplication (vs. JSON file)
+   - *Why:* Atomic writes, queryable, handles concurrent access
+   - *Trade-off:* Slightly more complex than JSON
+   - *Alternative:* Redis (overkill for single-machine)
+
+2. **Per-account scraping** with timeout (vs. global timeout)
+   - *Why:* One slow account shouldn't block others
+   - *Trade-off:* More complex error handling
+   - *Alternative:* Parallel scraping (race conditions with bird CLI)
+
+3. **Thread expansion** with `bird thread` (vs. manual reply scraping)
+   - *Why:* Captures full context, handles edge cases
+   - *Trade-off:* Slower, CDP dependency
+   - *Alternative:* Follow conversationId tree (fragile)
+
+---
+
+### Stage 2: Content Generation
+**Responsibility:** Pick best content, ground with real context, generate repurposed version, verify quality.
+
+**Inputs:**
+- Candidate threads from Stage 1
+- Grounding context (SearXNG + Firecrawl)
+- Voice profile (style guide)
+- Posted content registry
+
+**Outputs:**
+- Generated thread (list of tweets)
+- Grounding verification report
+- Quality score
+
+**Failure Handling:**
+- LLM timeout → retry 2x, then skip
+- JSON parse error → retry with stricter prompt, then skip
+- Grounding score < 70 → skip, try next candidate
+- All candidates fail → alert, skip run
+
+**Key Decisions:**
+1. **Multi-candidate generation** (vs. single top pick)
+   - *Why:* If top pick fails verification, try next
+   - *Trade-off:* More LLM calls, higher cost
+   - *Alternative:* Force-post with warning (risk of bad content)
+
+2. **Stricter verification prompt** (vs. lenient fallback)
+   - *Why:* Current fallback rubber-stamps hallucinations
+   - *Trade-off:* More content skipped, lower throughput
+   - *Alternative:* Human-in-the-loop (not autonomous)
+
+3. **Post-processing character enforcement** (vs. trusting LLM)
+   - *Why:* LLM can't reliably count characters
+   - *Trade-off:* May need to split/merge tweets
+   - *Alternative:* Accept 270-290 char range (looser constraint)
+
+4. **Better grounding queries** (vs. naive topic extraction)
+   - *Why:* "month since since built" doesn't find relevant context
+   - *Trade-off:* More complex query extraction logic
+   - *Alternative:* Skip grounding (lose factual accuracy)
+
+**Grounding Query Strategy:**
+```
+Current: Extract topics → search "month since since built"
+Proposed: 
+  1. Extract key entities (tools, numbers, concepts)
+  2. Generate 3-5 search queries per entity
+  3. Deduplicate and rank by relevance
+  4. Fetch top 5 sources
+  5. Extract key facts (dates, stats, quotes)
+```
+
+---
+
+### Stage 3: Content Posting
+**Responsibility:** Post thread via ego-browser, handle CDP session management, track results.
+
+**Inputs:**
+- Generated thread from Stage 2
+- Posting credentials (ego-browser)
+- Rate limit state
+
+**Outputs:**
+- Posted tweet IDs
+- Posting success/failure status
+
+**Failure Handling:**
+- CDP hang → kill, refresh session, retry from last successful tweet
+- Post button disabled → wait, retry 3x, then abort
+- Rate limit hit → wait, retry next cycle
+- Partial thread posted → log, alert, don't retry (avoid duplicates)
+
+**Key Decisions:**
+1. **CDP session refresh every 2 tweets** (vs. single session)
+   - *Why:* Prevents hangs on reply 3+
+   - *Trade-off:* Slower posting, more overhead
+   - *Alternative:* Keep session open (current approach, fails)
+
+2. **Idempotent posting** with tweet ID tracking (vs. fire-and-forget)
+   - *Why:* Can detect partial posts, avoid duplicates
+   - *Trade-off:* More state management
+   - *Alternative:* Accept partial posts (current approach)
+
+3. **Staggered posting** with 20s delays (vs. immediate)
+   - *Why:* Mimics human behavior, avoids rate limits
+   - *Trade-off:* Slower (2 min for 7-tweet thread)
+   - *Alternative:* Faster posting (risk of rate limit)
+
+4. **ego-browser task space isolation** (vs. shared)
+   - *Why:* Prevents collisions with manual posting
+   - *Trade-off:* More task spaces, cleanup needed
+   - *Alternative:* Global lock (blocks manual posting)
+
+---
+
+### Stage 4: Observability (New)
+**Responsibility:** Log all stages, alert on failures, track metrics.
+
+**Inputs:**
+- Stage outputs
+- Error states
+- Performance metrics
+
+**Outputs:**
+- Audit log (JSON)
+- Alerts (email/Slack/Telegram)
+- Metrics dashboard
+
+**Implementation:**
 ```python
-# services/research.py
-class ResearchService:
-    def __init__(self, post_repo: PostRepository):
-        self.post_repo = post_repo
-
-    def get_outliers(self, platform: str, hours: int, limit: int) -> list[OutlierPost]:
-        """Find posts with statistically unusual engagement."""
-        posts = self.post_repo.by_platform(platform, hours)
-        z_scores = compute_z_scores([p.score for p in posts])
-        outliers = [
-            OutlierPost.from_post(post, z)
-            for post, z in zip(posts, z_scores)
-            if z > 2.0
-        ]
-        return sorted(outliers, key=lambda o: o.z_score, reverse=True)[:limit]
-```
-
-#### Repository Layer (`repositories/`)
-
-Thin wrappers around SQLite queries. All SQL lives here.
-
-```python
-# repositories/posts.py
-class PostRepository:
-    def __init__(self, get_conn: Callable[[], sqlite3.Connection]):
-        self._get_conn = get_conn
-
-    def by_platform(self, platform: str, hours: int) -> list[Post]:
-        conn = self._get_conn()
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        rows = conn.execute(
-            "SELECT * FROM posts WHERE platform = ? AND created_at > ? ORDER BY score DESC",
-            (platform, cutoff.isoformat())
-        ).fetchall()
-        return [Post(**dict(r)) for r in rows]
-```
-
-### 3.4 Frontend Module Breakdown
-
-#### State Management: Custom Hooks (not Zustand/Redux)
-
-For a single-user app, Zustand/Redux is overkill. Custom hooks with `useReducer` provide the same benefits with zero dependencies:
-
-```typescript
-// hooks/useChatStore.ts
-interface ChatState {
-  messages: Message[];
-  isLoading: boolean;
-  latestScores: ViralScores | null;
-  error: ChatError | null;
-}
-
-type ChatAction =
-  | { type: 'SEND_MESSAGE'; content: string }
-  | { type: 'RECEIVE_RESPONSE'; message: Message; scores?: ViralScores }
-  | { type: 'SET_LOADING'; loading: boolean }
-  | { type: 'SET_ERROR'; error: ChatError }
-  | { type: 'CLEAR_MESSAGES' }
-  | { type: 'RETRY_LAST' };
-
-export function useChatStore() {
-  const [state, dispatch] = useReducer(chatReducer, initialChatState);
-  // ... action creators that call API and dispatch
-  return { ...state, dispatch };
-}
-```
-
-**Why not Zustand?** Single-user app, 5 stores max. `useReducer` + context gives us:
-- Zero new dependencies
-- Same devtools experience (React DevTools shows reducer state)
-- Action creators are just functions that call `dispatch`
-- Easy to test (pure reducer functions)
-
-**Trade-off acknowledged:** If the app grows beyond ~10 stores or needs cross-store orchestration, migrate to Zustand. The reducer pattern makes this migration trivial (reducers become store definitions).
-
-#### Page Decomposition
-
-```
-app/
-├── layout.tsx          ← Providers, NavSidebar (persistent shell)
-├── page.tsx            ← Thin router: reads activeNav, renders view
-├── views/
-│   ├── ChatView.tsx    ← ChatPanel + WorkspaceSidebar
-│   ├── ResearchView.tsx← ResearchFeed
-│   ├── SearchView.tsx  ← SearchView
-│   ├── HistoryView.tsx ← HistoryView
-│   ├── CreatorView.tsx ← CreatorView
-│   ├── SettingsView.tsx← SettingsView
-│   ├── BoardsView.tsx  ← BoardsView
-│   ├── ProjectsView.tsx← ProjectsView
-│   ├── VoiceView.tsx   ← VoiceView
-│   └── TranscribeView.tsx
-└── api/
-    └── chat/
-        └── route.ts    ← LLM proxy (stays server-side)
-```
-
-`page.tsx` drops from 682 → ~40 lines:
-
-```typescript
-export default function Home() {
-  const [activeNav, setActiveNav] = useNavStore();
-  
-  return (
-    <div className="flex h-screen">
-      <NavSidebar activeNav={activeNav} onNavChange={setActiveNav} />
-      <ViewRouter activeNav={activeNav} />
-    </div>
-  );
-}
-```
-
-#### API Client Layer
-
-Single typed wrapper replaces scattered `fetch()` calls:
-
-```typescript
-// lib/api.ts
-class SgosClient {
-  constructor(private baseUrl: string) {}
-
-  private async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options?.headers,
-      },
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new SgosError(res.status, body.detail || res.statusText);
+# Audit log structure
+{
+  "run_id": "2026-07-06-10-00-00",
+  "timestamp": "2026-07-06T10:00:00Z",
+  "stages": {
+    "scraping": {
+      "status": "success",
+      "accounts_scraped": 2,
+      "tweets_scraped": 30,
+      "threads_detected": 12,
+      "duration_seconds": 45
+    },
+    "generation": {
+      "status": "success",
+      "candidates_tried": 3,
+      "grounding_sources": 4,
+      "verification_score": 85,
+      "duration_seconds": 30
+    },
+    "posting": {
+      "status": "partial",
+      "tweets_posted": 3,
+      "tweets_failed": 4,
+      "tweet_ids": ["123", "124", "125"],
+      "failure_reason": "CDP hang on tweet 4",
+      "duration_seconds": 120
     }
-    return res.json();
-  }
-
-  // Typed methods — auto-generated from OpenAPI spec
-  outliers = (platform: string, hours = 24) =>
-    this.request<OutlierPost[]>(`/outliers?platform=${platform}&hours=${hours}`);
-  
-  search = (q: string, limit = 20) =>
-    this.request<SearchResult[]>(`/search?q=${encodeURIComponent(q)}&limit=${limit}`);
-  // ...
+  },
+  "errors": [
+    {
+      "stage": "posting",
+      "error": "CDP timeout",
+      "retry_count": 2,
+      "resolved": false
+    }
+  ],
+  "alert_sent": true
 }
-
-export const api = new SgosClient(process.env.NEXT_PUBLIC_SGOS_URL || 'http://localhost:8420');
 ```
 
-### 3.5 Configuration Layer
+**Alerting Strategy:**
+- **Critical:** No content posted (all stages failed)
+- **Warning:** Partial thread posted, verification failures
+- **Info:** Successful run, metrics
 
-Replace scattered `os.environ.get()` calls with validated `pydantic-settings`:
+**Delivery:**
+- Telegram bot (already configured)
+- Email (optional)
+- Log file (always)
 
-```python
-# config.py
-from pydantic_settings import BaseSettings
+---
 
-class Settings(BaseSettings):
-    # Server
-    host: str = "0.0.0.0"
-    port: int = 8420
-    api_key: str = ""  # empty = dev mode (no auth)
-    debug: bool = False
-    
-    # Database
-    db_path: str = "sgos.db"
-    db_busy_timeout: int = 5000
-    
-    # LLM
-    llm_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    llm_api_key: str = ""
-    llm_model: str = "qwen-latest-series-invite-beta-v34"
-    llm_timeout: int = 60
-    llm_max_retries: int = 5
-    
-    # SSH (3090 server)
-    ssh_host: str = "3090-lan"
-    searxng_port: int = 8888
-    firecrawl_port: int = 3002
-    
-    # Ingestion
-    ingestion_batch_size: int = 30
-    ingestion_timeout: int = 30
-    
-    model_config = SettingsConfigDict(env_prefix="SGOS_", env_file=".env")
+## Data Model
 
-settings = Settings()  # Validated at import time — fails fast on bad config
-```
-
-**Trade-off:** `pydantic-settings` adds a dependency (~50KB). Worth it for:
-- Fail-fast validation at startup (not silent failures mid-request)
-- Single source of truth for all config
-- Auto-generated `.env.example` from the schema
-- Type-safe access everywhere (`settings.llm_timeout` vs `int(os.environ.get("SGOS_LLM_TIMEOUT", "60"))`)
-
-### 3.6 Background Task Queue
-
-**Decision: asyncio tasks, not Celery/RQ.**
-
-| Option | Pros | Cons | Verdict |
-|--------|------|------|---------|
-| **asyncio BackgroundTasks** | Zero deps, built into FastAPI, simple | No persistence, lost on restart | ✅ Use now |
-| **Celery + Redis** | Persistent, distributed, retry policies | Heavy: Redis + worker process + config | ❌ Overkill |
-| **ARQ (async Redis Queue)** | Async-native, lightweight | Still needs Redis | ❌ Not needed yet |
-| **SQLite job table** | Persistent, no deps, simple | Manual retry logic needed | ⏳ Phase 2 |
-
-**Phase 1 (now):** FastAPI `BackgroundTasks` for ingestion. Jobs are fire-and-forget. If the server restarts, cron jobs re-run ingestion.
-
-**Phase 2 (if needed):** Add a `jobs` table to SQLite:
+### SQLite Schema
 
 ```sql
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,          -- 'ingest_reddit', 'analyze', 'scrape'
-    payload TEXT,                -- JSON
-    status TEXT DEFAULT 'pending', -- pending | running | done | failed
-    result TEXT,                 -- JSON
-    error TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
-    started_at TEXT,
-    completed_at TEXT,
-    retries INTEGER DEFAULT 0,
-    max_retries INTEGER DEFAULT 3
+-- Posted content registry
+CREATE TABLE posted_content (
+    id INTEGER PRIMARY KEY,
+    source_handle TEXT NOT NULL,
+    source_tweet_id TEXT NOT NULL,
+    source_conversation_id TEXT,
+    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    tweet_ids TEXT,  -- JSON array of posted tweet IDs
+    thread_length INTEGER,
+    grounding_score INTEGER,
+    status TEXT CHECK(status IN ('success', 'partial', 'failed'))
 );
+
+CREATE INDEX idx_source_tweet ON posted_content(source_tweet_id);
+CREATE INDEX idx_posted_at ON posted_content(posted_at);
+
+-- Grounding cache
+CREATE TABLE grounding_cache (
+    id INTEGER PRIMARY KEY,
+    query TEXT NOT NULL,
+    sources TEXT,  -- JSON array of source URLs
+    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ttl_hours INTEGER DEFAULT 24
+);
+
+CREATE INDEX idx_query ON grounding_cache(query);
 ```
 
-This gives persistence and retry without any external deps.
+**Why SQLite:**
+- Single file, no server needed
+- Atomic writes, handles concurrent access
+- Queryable (find duplicates, recent posts)
+- Backup is just file copy
 
-### 3.7 Structured Logging
-
-**Decision: `structlog` with JSON output.**
-
-```python
-import structlog
-
-logger = structlog.get_logger()
-
-# In service layer:
-logger.info("ingestion_complete", 
-    platform="reddit", 
-    posts_added=15, 
-    duplicates_skipped=42, 
-    duration_s=3.2)
-
-# Output:
-# {"event": "ingestion_complete", "platform": "reddit", "posts_added": 15, ...}
-```
-
-**Why not `logging` stdlib?** Structured JSON logs are:
-- Grep-able by field (`jq 'select(.platform == "reddit")'`)
-- Parseable by log aggregators if we ever deploy
-- Include request IDs for tracing
-
-**Trade-off:** `structlog` is a dependency. Alternative: use stdlib `logging` with a JSON formatter. Acceptable if we want zero deps, but `structlog`'s context binding is significantly more ergonomic.
-
-### 3.8 API Versioning
-
-**Decision: No versioning for now.**
-
-| Option | Pros | Cons | Verdict |
-|--------|------|------|---------|
-| **URL prefix (`/v1/`)** | Standard, explicit | Frontend must update on every rename | ❌ Premature |
-| **Header versioning** | Clean URLs | Harder to test in browser | ❌ |
-| **No versioning** | Simple, co-deployed | Breaking changes require coordinated deploy | ✅ Use now |
-
-**Rationale:** Frontend and backend are deployed together. Breaking changes are coordinated. Adding `/v1/` prefix now adds ceremony without benefit. When the API is consumed by a third client (mobile app, CLI tool), add versioning then.
-
-**Escape hatch:** The router decomposition naturally enables future versioning — `routers/v2/research.py` can coexist with `routers/v1/research.py`.
+**Why not JSON:**
+- No atomic writes (race conditions)
+- Can't query efficiently (load entire file)
+- Gets slow with 1000+ entries
 
 ---
 
-## 4. Data Architecture
+## Scalability Considerations
 
-### 4.1 SQLite Schema (Current)
+### Current Limits
+- **Accounts:** 2 (hardcoded)
+- **Posts per day:** 1 (rate limit)
+- **Thread length:** 7 tweets (arbitrary)
+- **Grounding sources:** 5 (SearXNG + Firecrawl)
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     sgos.db                             │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ posts    │    │ creators     │    │ boards       │  │
-│  │ ──────── │    │ ──────────── │    │ ──────────── │  │
-│  │ id (PK)  │    │ handle (PK)  │    │ id (PK)      │  │
-│  │ platform │    │ platform     │    │ name         │  │
-│  │ title    │    │ followed_at  │    │ created_at   │  │
-│  │ content  │    │ tags         │    └──────┬───────┘  │
-│  │ score    │    └──────┬───────┘           │          │
-│  │ url      │           │          ┌────────▼───────┐  │
-│  │ created  │    ┌──────▼───────┐  │ board_posts    │  │
-│  └────┬─────┘    │creator_posts │  │ (junction)     │  │
-│       │          └──────────────┘  └────────────────┘  │
-│       │                                                 │
-│  ┌────▼─────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │ posts_fts5   │  │ voice_       │  │ vector_      │  │
-│  │ (FTS index)  │  │ profiles     │  │ embeddings   │  │
-│  └──────────────┘  └──────────────┘  └──────────────┘  │
-│                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │ alerts       │  │ ideas        │  │ sessions     │  │
-│  └──────────────┘  └──────────────┘  └──────────────┘  │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
+### Scaling Up
+**More accounts:**
+- Current: Add to `TARGET_HANDLES` list
+- Bottleneck: Sequential scraping (30s per account)
+- Solution: Parallel scraping with asyncio (future)
 
-### 4.2 Database Strategy
+**More posts per day:**
+- Current: 24-hour rate limit
+- Bottleneck: ego-browser session management
+- Solution: Multiple ego-browser profiles (future)
 
-**Decision: Stay on SQLite.**
+**Longer threads:**
+- Current: 7 tweets max
+- Bottleneck: CDP hang on reply 3+
+- Solution: Session refresh every 2 tweets (implemented in Stage 3)
 
-| Concern | SQLite Reality | Do We Need More? |
-|---------|---------------|-----------------|
-| **Write throughput** | ~50K writes/sec with WAL | We ingest ~100 posts/day |
-| **Read throughput** | Unlimited concurrent readers | 1 user, 1 browser |
-| **Data size** | Handles 100GB+ databases | We have ~50MB |
-| **Concurrency** | 1 writer, unlimited readers | No concurrent writers |
-| **Backup** | Copy the file | Simple, works |
-| **Full-text search** | FTS5 built-in, fast | Already using it |
-
-**When to migrate to Postgres:**
-- Multiple concurrent writers (team usage)
-- Need for real-time subscriptions (LISTEN/NOTIFY)
-- Full-text search becomes insufficient (need ranking, faceting)
-
-None of these apply today.
-
-### 4.3 Connection Pooling Strategy (Implemented)
-
-```python
-# database.py — Thread-local connection pool
-_local = threading.local()
-
-def get_connection() -> sqlite3.Connection:
-    conn = getattr(_local, 'connection', None)
-    if conn is not None:
-        try:
-            conn.execute("SELECT 1")  # Health check
-            return conn
-        except sqlite3.Error:
-            _local.connection = None
-    
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    _local.connection = conn
-    return conn
-```
-
-This gives us:
-- **Thread safety**: Each thread gets its own connection
-- **Connection reuse**: No open/close overhead per query
-- **Health checking**: Automatically reconnects on failure
-- **WAL mode**: Concurrent reads during writes
+**Better grounding:**
+- Current: 5 sources max
+- Bottleneck: SearXNG/Firecrawl rate limits
+- Solution: Cache grounding results for 24h (Stage 2)
 
 ---
 
-## 5. Security Architecture
+## Extensibility
 
-### 5.1 Defense in Depth
+### Adding New Features
 
+**1. A/B Testing Voice Styles**
 ```
-Layer 1: Network     → localhost-only binding (or firewall)
-Layer 2: CORS        → Allow only localhost:3000
-Layer 3: CSRF        → Origin header validation on mutations
-Layer 4: Auth        → Bearer token (SGOS_API_KEY)
-Layer 5: Input       → Pydantic validation, query param bounds
-Layer 6: SSRF        → URL scheme/host blocking
-Layer 7: Injection   → shlex.quote() on shell commands
-Layer 8: Sandbox     → iframe sandbox on rendered HTML
-Layer 9: File limits → 100MB upload cap, chunked download
+Current: Single voice profile
+Future: 
+  - Generate 2-3 versions per thread
+  - Post to different accounts
+  - Track engagement
+  - Pick winner
 ```
 
-### 5.2 Secrets Management
-
+**2. Multi-Platform Posting**
 ```
-Current:  .env file + os.environ.get()  ← scattered, no validation
-Target:   pydantic-settings + .env      ← validated at startup
-
-Secrets that should NEVER be in code:
-  - SGOS_API_KEY (backend auth)
-  - SGOS_LLM_API_KEY (LLM provider)
-  - FIRECRAWL_API_KEY (scraping)
-  - ZAI_API_KEY (Z.AI search)
-
-Frontend secrets flow:
-  localStorage (Settings UI) → request body → API route → LLM provider
-  (never stored server-side, never in version control)
+Current: X/Twitter only
+Future:
+  - LinkedIn (long-form)
+  - Reddit (thread → post)
+  - Newsletter (thread → email)
 ```
 
-### 5.3 SSH Command Safety
+**3. Content Calendar**
+```
+Current: Post best content immediately
+Future:
+  - Schedule posts for optimal times
+  - Balance content types (threads vs. long posts)
+  - Avoid posting same topic twice in a week
+```
 
-All SSH commands to the 3090 server go through a validated helper:
-
-```python
-def ssh_command(host: str, command: str, timeout: int = 30) -> str:
-    """Execute a command on a remote host via SSH. All arguments are shell-quoted."""
-    safe_cmd = shlex.quote(command)
-    result = subprocess.run(
-        ["ssh", host, safe_cmd],
-        capture_output=True, text=True, timeout=timeout
-    )
-    return result.stdout
+**4. Engagement Tracking**
+```
+Current: No tracking
+Future:
+  - Scrape engagement metrics after 24h
+  - Correlate with content type, time, account
+  - Optimize posting strategy
 ```
 
 ---
 
-## 6. Performance Architecture
+## Trade-Offs
 
-### 6.1 Hot Paths and Optimization
+### Decisions Made
 
-| Path | Current | Target | Optimization |
-|------|---------|--------|--------------|
-| `/search` | FTS5 full scan | FTS5 + LIMIT | Already fast (<50ms) |
-| `/search/similar` | O(n) cosine sim | Pre-filter by keyword intersection | 5-10× faster for large datasets |
-| `/outliers` | Load all posts, compute Z | Indexed query + batch Z-score | Already acceptable |
-| Ingestion | Sequential HTTP | `ThreadPoolExecutor(max_workers=10)` | 5× faster |
-| LLM call | 15-60s per request | Streaming SSE | Better UX, no timeout risk |
-| Frontend render | Re-render on every keystroke | `React.memo` + debouncing | Already implemented |
+| Decision | Trade-Off | Rationale |
+|----------|-----------|-----------|
+| SQLite over JSON | Slightly more complex | Atomic writes, queryable |
+| Multi-candidate generation | Higher LLM cost | Better content quality |
+| CDP refresh every 2 tweets | Slower posting | Prevents hangs |
+| Stricter verification | Lower throughput | Prevents hallucinations |
+| Staggered posting (20s delays) | 2 min per thread | Mimics human behavior |
+| Per-account timeouts | Complex error handling | One slow account doesn't block |
 
-### 6.2 Caching Strategy
+### Decisions Deferred
 
-```
-Browser Cache:
-  - Static assets (Next.js handles this)
-  - Research feed data (stale-while-revalidate, 5min TTL)
-
-Server Cache (future):
-  - Trending topics (computed hourly, cached in-memory)
-  - Voice profiles (computed once, cached until retrain)
-  - Outlier detection results (cached until next ingestion)
-
-NOT caching:
-  - Search results (always fresh)
-  - LLM responses (always regenerate)
-  - Session data (always load from store)
-```
-
-### 6.3 Streaming Responses
-
-**Current:** Chat API returns full response after 15-60s.
-**Target:** Server-Sent Events (SSE) for progressive rendering.
-
-```python
-@app.get("/chat/stream")
-async def chat_stream(messages: list[Message], workspace: WorkspaceState):
-    async def event_generator():
-        async for chunk in llm_service.stream(messages, workspace):
-            yield f"data: {json.dumps(chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-    
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-```
-
-**Trade-off:** SSE adds complexity (connection management, partial response handling). Worth it because:
-- Eliminates timeout anxiety on slow LLM responses
-- Better UX (user sees text appearing, not a spinner)
-- Matches how every major chat UI works
+| Decision | Why Deferred | When to Revisit |
+|----------|--------------|-----------------|
+| Parallel scraping | bird CLI not thread-safe | If >5 accounts |
+| Multiple ego-browser profiles | Session management complexity | If >2 posts/day |
+| Human-in-the-loop | Breaks autonomy | If quality issues persist |
+| External LLM (OpenAI/Anthropic) | Cost, latency | If local LLM quality insufficient |
 
 ---
 
-## 7. Deployment Architecture
+## Implementation Plan
 
-### 7.1 Current (Development)
+### Phase 1: Foundation (Week 1)
+1. **SQLite registry** for deduplication
+2. **Audit logging** with JSON output
+3. **CDP session refresh** every 2 tweets
+4. **Stricter verification** with retry logic
 
-```
-┌─────────────────────────────────┐
-│  Mac (development machine)      │
-│                                 │
-│  ┌─────────────┐ ┌───────────┐ │
-│  │ Next.js dev │ │ FastAPI   │ │
-│  │ :3000       │ │ :8420     │ │
-│  └─────────────┘ └─────┬─────┘ │
-│                        │ SSH    │
-└────────────────────────┼────────┘
-                         │
-                  ┌──────▼──────┐
-                  │  3090 GPU   │
-                  │  Server     │
-                  │  ┌────────┐ │
-                  │  │SearXNG │ │
-                  │  │:8888   │ │
-                  │  ├────────┤ │
-                  │  │Fire-   │ │
-                  │  │crawl   │ │
-                  │  │:3002   │ │
-                  │  └────────┘ │
-                  └─────────────┘
-```
+**Deliverable:** Reliable single-thread posting with observability
 
-### 7.2 Target (Production — when ready)
+### Phase 2: Robustness (Week 2)
+1. **Multi-candidate generation** (try 3, pick best)
+2. **Better grounding queries** (entity extraction)
+3. **Alerting** on failures (Telegram)
+4. **Post-processing** character enforcement
 
-```
-┌───────────────────────────────────────────────┐
-│  VPS / Cloud Instance                         │
-│                                               │
-│  ┌──────────────────────────────────────┐     │
-│  │  Caddy (reverse proxy + TLS)         │     │
-│  │  :443 → auto-HTTPS via Let's Encrypt │     │
-│  └──────────┬───────────────────────────┘     │
-│             │                                 │
-│  ┌──────────▼───────────────────────────┐     │
-│  │  Docker Compose                      │     │
-│  │  ┌──────────┐  ┌──────────────────┐  │     │
-│  │  │ Next.js  │  │ FastAPI (uvicorn)│  │     │
-│  │  │ :3000    │  │ :8420            │  │     │
-│  │  └──────────┘  └────────┬─────────┘  │     │
-│  │                         │            │     │
-│  │  ┌──────────────────────▼──────────┐ │     │
-│  │  │ SQLite (volume-mounted)         │ │     │
-│  │  │ + automated daily backup        │ │     │
-│  │  └─────────────────────────────────┘ │     │
-│  └──────────────────────────────────────┘     │
-│                                               │
-│  Cron: daily ingestion, z-score recalculation │
-│                                               │
-└───────────────────────────────────────────────┘
-```
+**Deliverable:** High-quality content with failure recovery
 
-**Why Caddy over Nginx?** Zero-config HTTPS, simpler syntax, single binary.
-**Why Docker over bare metal?** Reproducible deploys, easy rollback, resource limits.
-**Why not Kubernetes?** Single user, single server. K8s is 100× overkill.
+### Phase 3: Scale (Week 3)
+1. **Expand target accounts** (add 5-10)
+2. **Optimize posting schedule** (best times)
+3. **Grounding cache** (24h TTL)
+4. **Metrics dashboard** (success rate, engagement)
 
-### 7.3 Backup Strategy
+**Deliverable:** Scalable system with monitoring
 
-```bash
-#!/bin/bash
-# Daily SQLite backup — atomic copy of WAL-mode database
-BACKUP_DIR="/backups/sgos"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+### Phase 4: Intelligence (Week 4+)
+1. **A/B testing** voice styles
+2. **Engagement tracking** (24h metrics)
+3. **Content calendar** (scheduling)
+4. **Multi-platform** (LinkedIn, Reddit)
 
-# sqlite3 .backup is safe during writes
-sqlite3 /data/sgos.db ".backup '/backups/sgos/sgos_${TIMESTAMP}.db'"
-
-# Keep last 7 days
-find $BACKUP_DIR -name "*.db" -mtime +7 -delete
-```
+**Deliverable:** Autonomous content optimization
 
 ---
 
-## 8. Migration Plan
+## Alternatives Evaluated
 
-### Phase 1: Foundation (1-2 days)
-**Goal:** Config layer + structured logging + router split
+### Alternative 1: n8n Workflow
+**Approach:** Use existing n8n instance (ZimaBoard, port 5678) to orchestrate stages.
 
-1. Add `pydantic-settings` → `config.py`
-2. Add `structlog` → replace `print()` calls
-3. Split `main.py` into `routers/` modules (move endpoints, keep behavior identical)
-4. Add `conftest.py` with test fixtures
+**Pros:**
+- Visual workflow builder
+- Built-in retry/error handling
+- HTTP nodes for SearXNG/Firecrawl
+- Webhook triggers
 
-**Risk:** Low. Pure refactoring, no behavior changes.
-**Verification:** `curl` all endpoints, verify identical responses.
+**Cons:**
+- Can't run Python scripts easily
+- No native bird CLI integration
+- Can't manage ego-browser CDP sessions
+- Overkill for single-machine setup
 
-### Phase 2: Service Layer (2-3 days)
-**Goal:** Extract business logic from endpoints
-
-1. Create `services/` with one service per domain
-2. Create `repositories/` with one repo per table
-3. Move SQL from scattered locations into repos
-4. Add unit tests for services (mock repos)
-
-**Risk:** Medium. Must preserve all existing behavior.
-**Verification:** Run all existing manual test flows.
-
-### Phase 3: Frontend Decomposition (1-2 days)
-**Goal:** Break up page.tsx god component
-
-1. Create `hooks/` with `useChatStore`, `useSessionStore`, `useWorkspaceStore`
-2. Create `views/` directory, move each view into its own file
-3. Create `lib/api.ts` typed client
-4. `page.tsx` becomes a thin router (~40 lines)
-
-**Risk:** Low. Component decomposition is well-understood.
-**Verification:** Full browser dogfood test of all views.
-
-### Phase 4: Async Ingestion (1 day)
-**Goal:** Non-blocking ingestion with progress tracking
-
-1. Add `BackgroundTasks` to ingestion endpoints
-2. Add `/ingest/status/{job_id}` endpoint
-3. Frontend polls status, shows progress bar
-
-**Risk:** Low. Additive change, existing sync endpoints remain.
-**Verification:** Trigger ingestion, verify non-blocking + progress.
-
-### Phase 5: Streaming Chat (2 days)
-**Goal:** SSE streaming for LLM responses
-
-1. Add `/chat/stream` endpoint with SSE
-2. Frontend `EventSource` consumer in `useChatStore`
-3. Progressive rendering in `ChatPanel`
-
-**Risk:** Medium. Must handle partial responses, connection drops.
-**Verification:** Send message, verify progressive rendering.
-
-### Phase 6: Docker + Deploy (1 day)
-**Goal:** Containerized deployment
-
-1. `Dockerfile` for backend (Python 3.11 slim + deps)
-2. `Dockerfile` for frontend (Next.js standalone output)
-3. `docker-compose.yml` with Caddy reverse proxy
-4. Health check endpoints
-5. Backup cron job
-
-**Risk:** Low. Well-documented patterns.
-**Verification:** Deploy to VPS, run full test suite.
+**Decision:** Rejected. Python orchestrator is simpler and more flexible.
 
 ---
 
-## 9. Alternatives Evaluated
+### Alternative 2: Queue-Based Architecture (Redis + Celery)
+**Approach:** Each stage is a Celery task, Redis as message broker.
 
-### 9.1 Backend Framework
+**Pros:**
+- True async processing
+- Built-in retry/rate limiting
+- Horizontal scaling
+- Distributed workers
 
-| Framework | Pros | Cons | Verdict |
-|-----------|------|------|---------|
-| **FastAPI** (current) | Async, Pydantic, OpenAPI auto-gen, dependency injection | Python ecosystem less mature for some ML tasks | ✅ Keep |
-| **Django REST** | Batteries included, admin panel, ORM | Too heavy, synchronous-first, not async-native | ❌ |
-| **Litestar** | Faster than FastAPI, better DI | Smaller ecosystem, less documentation | ⏳ Watch |
-| **Express/Hono** (Node) | Same language as frontend, fast | Lose Python ML ecosystem (Whisper, numpy, etc.) | ❌ |
+**Cons:**
+- Requires Redis server
+- Celery complexity (broker, workers, monitoring)
+- Overkill for single-machine, 2 accounts
+- Debugging is harder (distributed traces)
 
-### 9.2 Database
-
-| Database | Pros | Cons | Verdict |
-|----------|------|------|---------|
-| **SQLite** (current) | Zero config, embedded, FTS5 built-in, fast | Single writer, no horizontal scale | ✅ Keep |
-| **PostgreSQL** | Full-featured, concurrent writers, extensions | Operational overhead, connection pooling needed | ❌ Not needed |
-| **DuckDB** | Analytical queries, columnar | Not designed for OLTP, no FTS | ❌ Wrong tool |
-| **Turso (libSQL)** | SQLite-compatible, edge replication, serverless | External dependency, cost | ⏳ Phase 2 option |
-
-### 9.3 Frontend Framework
-
-| Framework | Pros | Cons | Verdict |
-|-----------|------|------|---------|
-| **Next.js** (current) | SSR, API routes, file routing, React ecosystem | Heavy for SPA, Turbopack quirks | ✅ Keep |
-| **Astro** | Lighter, islands architecture | Less mature for complex SPAs | ❌ |
-| **SvelteKit** | Smaller bundles, simpler DX | Smaller ecosystem, learning curve | ❌ Sunk cost |
-| **Tauri + Leptos** | Native app, Rust performance | Massive rewrite, Rust learning curve | ❌ |
-
-### 9.4 LLM Provider
-
-| Provider | Pros | Cons | Verdict |
-|----------|------|------|---------|
-| **Aliyun/Qwen** (current) | Cheap, good quality, intl endpoint | Rate limits, occasional downtime | ✅ Primary |
-| **OpenAI** | Best quality, most reliable | Expensive ($$$ per token) | ❌ Budget |
-| **Anthropic** | Best at long-form, safety | Expensive, slower | ❌ Budget |
-| **Local (llama.cpp)** | Free, private, no rate limits | Needs GPU, lower quality | ⏳ Phase 2 |
-| **Groq** | Fastest inference | Limited models, rate limits | ⏳ Backup |
-
-### 9.5 State Management
-
-| Approach | Pros | Cons | Verdict |
-|----------|------|------|---------|
-| **useReducer + hooks** (target) | Zero deps, testable, simple | Manual boilerplate, no devtools | ✅ Use |
-| **Zustand** | Minimal API, devtools, middleware | New dependency, learning curve | ⏳ If grows |
-| **Redux Toolkit** | Full-featured, time-travel debug | Massive boilerplate, overkill | ❌ |
-| **Jotai** | Atomic, fine-grained reactivity | Mental model shift, less predictable | ❌ |
-| **Context + useState** (current) | Simple, built-in | Prop drilling, stale closures, re-render storms | ❌ Being replaced |
+**Decision:** Rejected. Overengineered for current scale. Revisit if >10 accounts.
 
 ---
 
-## 10. Key Decisions Log
+### Alternative 3: Microservices (FastAPI + Docker)
+**Approach:** Each stage is a FastAPI service, communicate via HTTP.
 
-| # | Decision | Date | Rationale |
-|---|----------|------|-----------|
-| D1 | Stay on SQLite | 2026-06 | Single user, WAL handles our load, zero ops overhead |
-| D2 | Thread-local connection pool | 2026-06 | Avoids per-query connection overhead, thread-safe |
-| D3 | FastAPI BackgroundTasks over Celery | 2026-06 | Zero deps, cron handles retry, complexity isn't justified |
-| D4 | useReducer over Zustand | 2026-06 | Zero deps for single-user app, easy migration path if needed |
-| D5 | pydantic-settings over manual env parsing | 2026-06 | Fail-fast validation, single source of truth |
-| D6 | Origin-based CSRF over token-based | 2026-06 | Simpler, works with Bearer auth, sufficient for same-origin SPA |
-| D7 | No API versioning | 2026-06 | Co-deployed frontend/backend, no third-party consumers yet |
-| D8 | SSE streaming over WebSocket | 2026-06 | Simpler (HTTP-based), one-directional (server→client), built-in reconnect |
-| D9 | Caddy over Nginx | 2026-06 | Zero-config HTTPS, simpler config, single binary |
-| D10 | Docker Compose over Kubernetes | 2026-06 | Single server, single user, K8s is 100× overkill |
+**Pros:**
+- Clean separation of concerns
+- Independent scaling
+- API-first design
+- Easy to add new stages
 
----
+**Cons:**
+- Docker orchestration complexity
+- Network overhead (localhost HTTP calls)
+- Harder to debug (multiple containers)
+- Overkill for monolithic script replacement
 
-## 11. Future Requirements (Roadmap)
-
-| Feature | Timeline | Architecture Impact |
-|---------|----------|---------------------|
-| **Multi-device sync** | Q3 2026 | Server-side sessions, WebSocket for live updates |
-| **Scheduled content** | Q3 2026 | Job queue with cron scheduling, publish-at-time |
-| **Analytics dashboard** | Q4 2026 | Chart.js/D3 views, time-series aggregation queries |
-| **Local LLM fallback** | Q4 2026 | llama.cpp integration, model management, GPU scheduling |
-| **Browser extension** | 2027 | API versioning required, OAuth2 flow, CORS expansion |
-| **Team/multi-user** | 2027 | PostgreSQL migration, RBAC, per-user data isolation |
-| **Mobile app** | 2027 | API versioning, push notifications, offline sync |
-
-### When to Migrate Off SQLite
-
-Migrate to PostgreSQL when ANY of these become true:
-- Multiple concurrent writers (team usage)
-- Database exceeds 10GB
-- Need real-time subscriptions (LISTEN/NOTIFY)
-- Need full-text search with ranking/faceting beyond FTS5
-- Need geographic replication
-
-### When to Add a Message Queue
-
-Add Redis + ARQ when ANY of these become true:
-- Ingestion jobs take >5 minutes and need progress tracking
-- Need guaranteed delivery (not just cron retry)
-- Need job prioritization (user-triggered > scheduled)
-- Need distributed workers (multiple servers)
+**Decision:** Rejected. Monolithic orchestrator with modular functions is simpler.
 
 ---
 
-## 12. File Structure (Target)
+### Alternative 4: Serverless (AWS Lambda / Cloudflare Workers)
+**Approach:** Each stage is a serverless function.
+
+**Pros:**
+- No server management
+- Auto-scaling
+- Pay-per-use
+
+**Cons:**
+- Can't run bird CLI (requires Chrome)
+- Can't run ego-browser (requires persistent CDP)
+- Cold start latency
+- Vendor lock-in
+
+**Decision:** Rejected. Requires persistent browser sessions, not serverless.
+
+---
+
+## Risk Assessment
+
+### High Risk
+1. **ego-browser instability** — CDP hangs, session management
+   - *Mitigation:* Session refresh, timeout handling, alerting
+   - *Contingency:* Manual posting if automation fails
+
+2. **LLM hallucinations** — Grounding verification failures
+   - *Mitigation:* Stricter verification, multi-candidate generation
+   - *Contingency:* Human review for low-confidence content
+
+3. **Rate limiting** — X/Twitter blocks account
+   - *Mitigation:* Conservative rate limits, staggered posting
+   - *Contingency:* Reduce posting frequency, rotate accounts
+
+### Medium Risk
+1. **bird CLI breaking changes** — API updates, auth issues
+   - *Mitigation:* Version pinning, error handling
+   - *Contingency:* Fallback to manual scraping
+
+2. **SearXNG/Firecrawl downtime** — Grounding fails
+   - *Mitigation:* Retry logic, graceful degradation
+   - *Contingency:* Skip grounding, post with warning
+
+3. **Content quality degradation** — LLM generates poor content
+   - *Mitigation:* Quality scoring, human review
+   - *Contingency:* Revert to manual content creation
+
+### Low Risk
+1. **SQLite corruption** — Database file locked/corrupted
+   - *Mitigation:* WAL mode, regular backups
+   - *Contingency:* Rebuild from X/Twitter history
+
+2. **Cron job failure** — Scheduler doesn't trigger
+   - *Mitigation:* Multiple schedulers (cron + cronjob)
+   - *Contingency:* Manual trigger
+
+---
+
+## Success Metrics
+
+### Phase 1 (Foundation)
+- ✅ All stages complete without hanging
+- ✅ Audit log captures all runs
+- ✅ No duplicate posts
+- ✅ CDP hangs reduced by 80%
+
+### Phase 2 (Robustness)
+- ✅ Grounding verification score > 80 (real, not fallback)
+- ✅ 90% of runs post complete threads
+- ✅ Alerts sent within 5 min of failure
+- ✅ Character count enforcement (280-380) accurate
+
+### Phase 3 (Scale)
+- ✅ 5+ target accounts
+- ✅ 3+ posts per week
+- ✅ Grounding cache hit rate > 50%
+- ✅ Dashboard shows 7-day trends
+
+### Phase 4 (Intelligence)
+- ✅ A/B tests running (2+ voice styles)
+- ✅ Engagement tracking (likes, replies, bookmarks)
+- ✅ Content calendar (scheduled posts)
+- ✅ Multi-platform (X + LinkedIn)
+
+---
+
+## Conclusion
+
+The current system works when everything goes right but is fragile at every layer. The proposed architecture separates concerns, adds observability, and handles failures gracefully.
+
+**Key Improvements:**
+1. **Modular stages** with explicit error boundaries
+2. **SQLite registry** for deduplication and audit trail
+3. **CDP session refresh** to prevent hangs
+4. **Stricter verification** to prevent hallucinations
+5. **Alerting** for failures
+6. **Multi-candidate generation** for better quality
+
+**Implementation:** 4 phases, starting with foundation (reliability), then robustness (quality), then scale (volume), then intelligence (optimization).
+
+**Next Steps:**
+1. Review this architecture document
+2. Approve Phase 1 implementation
+3. Start with SQLite registry and audit logging
+4. Iterate based on real-world failures
+
+---
+
+## Appendix: File Structure (Proposed)
 
 ```
 sgos-backend/
-├── config.py              ← pydantic-settings (all config)
-├── main.py                ← App factory, middleware stack, lifespan (~80 lines)
-├── database.py            ← Connection pool, migrations
-├── routers/
-│   ├── research.py        ← /outliers, /trends, /brief, /stats
-│   ├── search.py          ← /search, /search/hybrid, /search/similar
-│   ├── content.py         ← /repurpose, /ideas
-│   ├── ingestion.py       ← /ingest, /ingest/youtube, /ingest/topics
-│   ├── voice.py           ← /voice/*, /voices
-│   ├── creators.py        ← /creators/*
-│   ├── boards.py          ← /boards/*
-│   ├── alerts.py          ← /alerts/*
-│   ├── media.py           ← /transcribe/*
-│   └── analytics.py       ← /analyze
-├── services/
-│   ├── research.py        ← Outlier detection, trend analysis
-│   ├── content.py         ← LLM generation, repurposing
-│   ├── ingestion.py       ← Reddit/HN/YT/Twitter pipelines
-│   ├── voice.py           ← Profile extraction, training
-│   ├── search.py          ← Hybrid search orchestration
-│   ├── creators.py        ← Creator tracking, stats
-│   └── alerts.py          ← Alert generation, deduplication
-├── repositories/
-│   ├── posts.py           ← Post CRUD, FTS queries
-│   ├── boards.py          ← Board + junction table ops
-│   ├── creators.py        ← Creator + creator_post ops
-│   ├── voice.py           ← Voice profile storage
-│   ├── vectors.py         ← TF-IDF index operations
-│   └── alerts.py          ← Alert CRUD
-├── models/
-│   ├── requests.py        ← Pydantic request schemas
-│   ├── responses.py       ← Pydantic response schemas
-│   └── domain.py          ← Domain entities (Post, Board, Creator)
-├── middleware/
-│   ├── auth.py            ← Bearer token auth
-│   ├── csrf.py            ← Origin validation
-│   ├── logging.py         ← Request ID + structlog
-│   └── rate_limit.py      ← Per-endpoint rate limiting
-├── utils/
-│   ├── ssh.py             ← Safe SSH command helper
-│   ├── llm.py             ← LLM client (retry, timeout)
-│   └── scoring.py         ← Z-score, viral score computation
-├── tests/
-│   ├── conftest.py        ← Fixtures, test DB
-│   ├── test_research.py
-│   ├── test_search.py
-│   └── test_ingestion.py
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-└── pyproject.toml
-
-StraughterG-os/
-├── app/
-│   ├── layout.tsx         ← Providers, persistent shell
-│   ├── page.tsx           ← Thin router (~40 lines)
-│   └── api/
-│       └── chat/
-│           └── route.ts   ← LLM proxy
-├── views/
-│   ├── ChatView.tsx
-│   ├── ResearchView.tsx
-│   ├── SearchView.tsx
-│   ├── HistoryView.tsx
-│   ├── CreatorView.tsx
-│   ├── SettingsView.tsx
-│   ├── BoardsView.tsx
-│   ├── ProjectsView.tsx
-│   ├── VoiceView.tsx
-│   └── TranscribeView.tsx
-├── components/
-│   ├── ChatPanel.tsx
-│   ├── NavSidebar.tsx
-│   ├── WorkspaceSidebar.tsx
-│   └── ... (reusable UI components)
-├── hooks/
-│   ├── useChatStore.ts    ← useReducer for chat state
-│   ├── useSessionStore.ts ← Session management
-│   ├── useWorkspaceStore.ts
-│   └── useNavStore.ts
-├── lib/
-│   ├── api.ts             ← Typed API client
-│   ├── types.ts           ← Shared TypeScript types
-│   ├── research.ts        ← Z.AI MCP search
-│   ├── systemPrompt.ts    ← Prompt builder
-│   └── sessionStore.ts    ← localStorage persistence
-├── Dockerfile
-└── package.json
+├── scripts/
+│   ├── ecomchigga_repurpose.py          # Current monolithic script (deprecated)
+│   ├── repurpose/                       # New modular system
+│   │   ├── __init__.py
+│   │   ├── orchestrator.py              # Coordinates stages
+│   │   ├── scraping.py                  # Stage 1: Content scraping
+│   │   ├── generation.py                # Stage 2: Content generation
+│   │   ├── posting.py                   # Stage 3: Content posting
+│   │   ├── observability.py             # Stage 4: Logging/alerting
+│   │   ├── database.py                  # SQLite registry
+│   │   ├── grounding.py                 # SearXNG/Firecrawl integration
+│   │   ├── verification.py              # Grounding verification
+│   │   └── config.py                    # Configuration
+│   └── ...
+├── data/
+│   ├── repurpose.db                     # SQLite database
+│   ├── audit_logs/                      # JSON audit logs
+│   │   └── 2026-07-06-10-00-00.json
+│   └── grounding_cache/                 # Cached grounding results
+└── tests/
+    ├── test_scraping.py
+    ├── test_generation.py
+    ├── test_posting.py
+    └── test_orchestrator.py
 ```
 
 ---
 
-## 13. Monitoring and Observability
-
-### 13.1 Health Checks
-
-```python
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "version": settings.version,
-        "database": {
-            "posts": post_count,
-            "size_mb": db_size_mb,
-            "wal_checkpoint": wal_status,
-        },
-        "uptime_s": time.time() - start_time,
-        "llm": "reachable" if llm_ping() else "unreachable",
-    }
-```
-
-### 13.2 Metrics (Future)
-
-When deploying to production, add Prometheus metrics:
-
-```python
-from prometheus_fastapi_instrumentator import Instrumentator
-
-Instrumentator().instrument(app).expose(app, endpoint="/metrics")
-```
-
-Tracked metrics:
-- Request latency (p50, p95, p99) by endpoint
-- Error rate by endpoint and status code
-- LLM call duration and token usage
-- Ingestion job duration and success rate
-- Database query duration
-- Active connections
-
-### 13.3 Alerting
-
-Current: Cron job checks for outliers and sends alerts via the `/alerts` endpoint.
-Future: Add webhook notifications (Telegram, email) for critical alerts.
-
----
-
-## 14. Migration Status
-
-### ✅ Phase 1: Foundation — COMPLETED 2026-06-24
-
-| Change | Before | After |
-|--------|--------|-------|
-| `main.py` | 1,164 LOC god-component | ~95 LOC app factory |
-| Config | `os.environ.get()` scattered across 12+ files | `config.py` (pydantic-settings, `SGOS_` prefix) |
-| Routing | 53 endpoints in one file | 11 domain routers in `routers/` |
-| Endpoints verified | — | All 53 via live server (health, search, outliers, ideas, voices, creators, boards, transcribe) |
-
-**New files created:**
-- `config.py` — centralized settings (pydantic-settings v2.14)
-- `routers/__init__.py`
-- `routers/research.py` — `/health`, `/outliers`, `/trends`, `/stats`, `/brief`
-- `routers/search.py` — `/search`, `/search/hybrid`, `/search/build-index`, `/search/similar`, `/search/related/{id}`
-- `routers/ingestion.py` — `/ingest`, `/ingest/sync`, `/ingest/posts`, `/ingest/youtube`, `/ingest/topics`, `/ingest/search`
-- `routers/voice.py` — `/voice/build`, `/voice/build-from-text`, `/voice/{name}`, `/voice/{name}/prompt`, `/voices`, `/analyze`
-- `routers/creators.py` — `/creators/follow`, `/creators/unfollow`, `/creators`, `/creators/{handle}/posts`, `/creators/stats`, `/creators/discover`
-- `routers/alerts.py` — `/alerts`, `/alerts/{id}/read`, `/alerts/outliers/check`, `/alerts/history`
-- `routers/boards.py` — `/boards` (CRUD), `/boards/{id}/posts` (save/unsave)
-- `routers/content.py` — `/repurpose`, `/repurpose/ai`, `/ideas/generate`, `/ideas`, `/carousel/*`, `/analytics/score/{id}`
-- `routers/scrape.py` — `/scrape`, `/outliers/{id}/deep-scrape`, `/outliers/deep-scrape`
-- `routers/media.py` — `/transcribe/status`, `/transcribe`, `/transcribe/url`
-- `routers/analytics.py` — `/analytics/explain/{id}`, `/analytics/patterns`
-
-### Phase 2: Service Layer — ✅ COMPLETED 2026-06-24
-
-| Change | Before | After |
-|--------|--------|-------|
-| Business logic | Inline in 11 router files | Separated into `services/` layer |
-| DB access | Direct `get_connection()` calls in routers | `repositories/posts.py` typed access |
-| Data models | Raw dicts everywhere | `models/domain.py`, `requests.py`, `responses.py` |
-
-**New files:**
-- `models/__init__.py`
-- `models/domain.py` — `Post`, `Creator`, `Board`, `VoiceProfile`, `OutlierAlert`
-- `models/requests.py` — `SearchRequest`, `IngestPostRequest`, `VoiceBuildRequest`, etc.
-- `models/responses.py` — `HealthResponse`, `SearchResponse`, `OutliersResponse`, `TrendsResponse`
-- `repositories/__init__.py`
-- `repositories/posts.py` — `PostRepository` with typed query methods
-- `services/__init__.py`
-- `services/research.py` — `ResearchService` (brief generation, outlier/trend queries)
-- `services/content.py` — `ContentService` (repurpose prompts, scoring, idea generation)
-- `services/ingestion.py` — `IngestionService` + `IngestionProgress` tracker
-
-### Phase 3: Frontend Decomposition — ✅ COMPLETED 2026-06-24
-
-| Change | Before | After |
-|--------|--------|-------|
-| `page.tsx` | 682 LOC god-component | ~170 LOC slim orchestrator |
-| State management | 15+ `useState` hooks inline | `useSessionStore` + `useChatStore` |
-| Components | `NavErrorBoundary` + `HomeView` inline | Extracted to `components/` |
-
-**New files:**
-- `hooks/useSessionStore.ts` — session CRUD, workspace state, persistence
-- `hooks/useChatStore.ts` — messages, send/retry, files, templates, error handling
-- `components/NavErrorBoundary.tsx` — React error boundary
-- `components/HomeView.tsx` — dashboard cards + quick start
-
-### Phase 4: Async Ingestion — ✅ COMPLETED 2026-06-24
-
-| Change | Before | After |
-|--------|--------|-------|
-| Ingestion | Fire-and-forget `threading.Thread` | `IngestionService` with progress tracking |
-| Status | None — had to check `/health` | `GET /ingest/status/{job_id}` + `GET /ingest/jobs` |
-
-### Phase 5: SSE Streaming — ✅ COMPLETED 2026-06-24
-
-| Change | Before | After |
-|--------|--------|-------|
-| Chat | Single JSON response (blocks until complete) | `POST /chat/stream` SSE — token-by-token delivery |
-
-**New files:**
-- `routers/chat.py` — SSE endpoint with system prompt builder for platform/tone/length
-
-### Phase 6: Deployment — ✅ COMPLETED 2026-06-24
-
-**New files:**
-- `sgos-backend/Dockerfile` — Python 3.11-slim + ffmpeg + uv + health check
-- `StraughterG-os/Dockerfile` — Node 20 multi-stage (deps → build → standalone)
-- `docker-compose.yml` — 3 services: backend + frontend + Caddy
-- `Caddyfile` — reverse proxy with gzip, security headers, auto-HTTPS
-- `.env.example` — all configurable env vars documented
-- `.dockerignore` — exclude node_modules, .next, __pycache__, .venv
-
----
-
-*This document is a living reference. Update it as the system evolves.*
+**Document Version:** 1.0  
+**Next Review:** After Phase 1 implementation

@@ -68,8 +68,8 @@ class VoiceMatchScorer:
             self._voice_tfidf = self._build_tfidf(combined)
             self._voice_norm = self._vector_norm(self._voice_tfidf)
             
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[warn] Voice profile load error: {e}")
 
     def score(self, variant: ContentVariant, genome: ViralGenome) -> float:
         """Score voice similarity (0-100). 50 = neutral if no profile."""

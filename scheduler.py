@@ -63,8 +63,22 @@ class IngestionScheduler:
             print(f"[Scheduler] Job {job_type} failed: {e}")
             return
 
-        # After ingestion completes, auto-run the viral content pipeline
+        # Wait for async ingestion to complete before running downstream pipeline
         if job_type == "full":
+            max_wait = 300  # 5 minutes
+            waited = 0
+            status = None
+            while waited < max_wait:
+                status = ingestion_progress.get(job_id)
+                if status and status.get("status") in ("completed", "failed"):
+                    break
+                time.sleep(5)
+                waited += 5
+
+            if status and status.get("status") == "failed":
+                print(f"[Scheduler] Ingestion failed: {status.get('error', 'unknown')}")
+                return
+
             try:
                 from services.pipeline import pipeline_engine, auto_train_and_refresh
                 from database import get_outliers
@@ -90,6 +104,15 @@ class IngestionScheduler:
                         print(f"[Scheduler] Weights retrained: {train_result['active_weights']}")
             except Exception as e:
                 print(f"[Scheduler] Pipeline post-process failed: {e}")
+
+        # Tracker: re-check tweet metrics at scheduled intervals
+        if job_type == "tracker":
+            try:
+                from tracker import refresh_due_tweets
+                result = refresh_due_tweets()
+                print(f"[Scheduler] Tracker: {result['refreshed']} tweets refreshed")
+            except Exception as e:
+                print(f"[Scheduler] Tracker refresh failed: {e}")
 
     def status(self) -> dict:
         """Get scheduler status."""
@@ -121,4 +144,6 @@ def init_scheduler():
     """Initialize and start the ingestion scheduler with default jobs."""
     # Reddit + HN full ingestion every 4 hours
     scheduler.add_job("full", interval_seconds=4 * 3600, enabled=True)
+    # Tracker: re-check tweet metrics every 6 hours
+    scheduler.add_job("tracker", interval_seconds=6 * 3600, enabled=True)
     scheduler.start()

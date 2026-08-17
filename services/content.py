@@ -78,6 +78,7 @@ Respond in JSON only:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=400,
+                extra_body={"enable_thinking": True},
             )
             content = response.choices[0].message.content.strip()
             if "```" in content:

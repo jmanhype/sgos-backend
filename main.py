@@ -6,12 +6,14 @@ All business logic lives in routers/ modules.
 import hmac
 import time
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+load_dotenv()  # Load .env BEFORE anything else reads os.environ
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from config import settings
+from config import settings, is_loopback
 from database import init_db
 from reddit_ingest import TARGET_SUBREDDITS
 from voice_profile import init_voice_tables
@@ -25,13 +27,46 @@ from scheduler import init_scheduler
 
 from routers import research, search, ingestion, voice, creators
 from routers import alerts, boards, content, scrape, media, analytics, chat
-from routers import pipeline
+from routers import pipeline, daily_alpha, strikes
 from routers import feedback
+from routers import brief
+from routers import tg_feedback
+from routers import track
+from routers import replies
+from routers import projects
+from routers import style_guide
+from routers import vbl
+
+
+def validate_binding_safety(cfg=None):
+    """Fail closed: refuse to serve when non-loopback binding has no auth.
+
+    Raises SystemExit(1) if host is not loopback and api_key is empty.
+    Preserves explicit loopback dev mode (127.0.0.1/::1/localhost + no key).
+    """
+    import sys
+    c = cfg or settings
+    if not c.api_key and not is_loopback(c.host):
+        log.error(
+            "auth.binding_unsafe",
+            host=c.host,
+            detail="Non-loopback binding without SGOS_API_KEY is forbidden. "
+                   "Set SGOS_API_KEY or bind to 127.0.0.1 for dev mode.",
+        )
+        print(
+            f"FATAL: Refusing to start — host={c.host} with no SGOS_API_KEY.\n"
+            f"  Set SGOS_API_KEY for production, or set SGOS_HOST=127.0.0.1 for local dev.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize all database tables on startup."""
+    # Fail closed before any initialization if binding is unsafe
+    validate_binding_safety()
+
     init_db()
     init_voice_tables()
     init_creator_tables()
@@ -39,6 +74,8 @@ async def lifespan(app: FastAPI):
     init_board_tables()
     init_ideas_table()
     ensure_scraped_at_column()
+    replies.init_reply_tables()
+    replies.seed_targets()
     log.info("sgos.startup", version=settings.version, db=settings.db_path, subreddits=len(TARGET_SUBREDDITS))
     if settings.api_key:
         log.info("auth.enabled")
@@ -169,6 +206,15 @@ app.include_router(analytics.router)
 app.include_router(chat.router)
 app.include_router(pipeline.router)
 app.include_router(feedback.router)
+app.include_router(brief.router)
+app.include_router(tg_feedback.router)
+app.include_router(track.router)
+app.include_router(replies.router)
+app.include_router(daily_alpha.router)
+app.include_router(strikes.router)
+app.include_router(projects.router)
+app.include_router(style_guide.router)
+app.include_router(vbl.router)
 
 
 if __name__ == "__main__":

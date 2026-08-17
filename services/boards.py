@@ -47,7 +47,6 @@ class BoardsService:
             if row:
                 post = dict(row)
 
-        conn.close()
 
         if not post:
             return {"error": "Post not found in database"}

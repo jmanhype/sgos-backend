@@ -60,6 +60,8 @@ class GenomeRepository:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pipeline_opportunities)").fetchall()}
         if "content_hash" not in cols:
             conn.execute("ALTER TABLE pipeline_opportunities ADD COLUMN content_hash TEXT DEFAULT ''")
+        if "grounding_score" not in cols:
+            conn.execute("ALTER TABLE pipeline_opportunities ADD COLUMN grounding_score INTEGER DEFAULT 0")
 
         # Now create indexes (safe after migration)
         conn.executescript(f"""
@@ -88,10 +90,20 @@ class GenomeRepository:
         conn = get_connection()
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(f"""
-            INSERT OR REPLACE INTO {self.TABLE_NAME}
+            INSERT INTO {self.TABLE_NAME}
                 (post_id, hook_type, hook_text, emotional_arc, structural_pattern,
                  key_phrases, content_length_words, platform_signals, engagement_score, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(post_id) DO UPDATE SET
+                hook_type=excluded.hook_type,
+                hook_text=excluded.hook_text,
+                emotional_arc=excluded.emotional_arc,
+                structural_pattern=excluded.structural_pattern,
+                key_phrases=excluded.key_phrases,
+                content_length_words=excluded.content_length_words,
+                platform_signals=excluded.platform_signals,
+                engagement_score=excluded.engagement_score,
+                created_at=excluded.created_at
         """, (
             genome.post_id,
             genome.hook_type,
@@ -165,8 +177,8 @@ class GenomeRepository:
         now = datetime.now(timezone.utc).isoformat()
         cursor = conn.execute("""
             INSERT INTO pipeline_opportunities
-                (genome_id, variant_type, title, content, content_hash, score, score_breakdown, hook, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (genome_id, variant_type, title, content, content_hash, score, score_breakdown, hook, grounding_score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             variant.genome_id,
             variant.variant_type,
@@ -176,6 +188,7 @@ class GenomeRepository:
             variant.score,
             json.dumps(variant.score_breakdown),
             variant.hook,
+            getattr(variant, 'grounding_score', 0),
             now,
         ))
         # Increment opportunity count on the genome

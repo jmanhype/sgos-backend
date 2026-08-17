@@ -23,7 +23,7 @@ def get_connection() -> sqlite3.Connection:
     opening/closing on every call while keeping threads isolated.
     """
     conn = getattr(_local, 'connection', None)
-    if conn is not None:
+    if conn is not None and isinstance(conn, sqlite3.Connection):
         # Validate the connection is still usable
         try:
             conn.execute("SELECT 1")
@@ -35,12 +35,15 @@ def get_connection() -> sqlite3.Connection:
             except Exception:
                 pass
             _local.connection = None
+    elif conn is not None:
+        # Corrupted pool entry (e.g., int, str) — discard and recreate
+        _local.connection = None
 
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")  # Wait 5s for locks instead of failing
+    conn.execute("PRAGMA busy_timeout=30000")  # Wait 30s for locks (ingestion can hold lock for minutes)
     conn.execute("PRAGMA synchronous=NORMAL")  # WAL + NORMAL = safe + fast
     _local.connection = conn
     return conn
@@ -221,7 +224,7 @@ def update_sub_stats(subreddit: str):
 
 
 def compute_z_scores(subreddit: str):
-    """Update z_scores for all posts in a subreddit."""
+    """Update z_scores for all posts in a subreddit — single batch UPDATE."""
     conn = get_connection()
     c = conn.cursor()
 
@@ -234,14 +237,11 @@ def compute_z_scores(subreddit: str):
         mean = stats["mean_score"]
         stddev = stats["stddev_score"]
 
-        posts = c.execute(
-            "SELECT id, score FROM posts WHERE subreddit=?",
-            (subreddit,)
-        ).fetchall()
-
-        for post in posts:
-            z = (post["score"] - mean) / stddev if stddev > 0 else 0
-            c.execute("UPDATE posts SET z_score=? WHERE id=?", (z, post["id"]))
+        # Single batch UPDATE instead of N individual queries
+        c.execute(
+            "UPDATE posts SET z_score = (score - ?) / ? WHERE subreddit = ?",
+            (mean, stddev, subreddit)
+        )
 
     conn.commit()
 

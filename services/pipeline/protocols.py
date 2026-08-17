@@ -105,6 +105,7 @@ class ContentVariant:
         score: float = 0.0,
         score_breakdown: dict | None = None,
         hook: str = "",
+        grounding_score: int = 0,
     ):
         self.genome_id = genome_id
         self.variant_type = variant_type
@@ -113,6 +114,7 @@ class ContentVariant:
         self.score = score
         self.score_breakdown = score_breakdown or {}
         self.hook = hook
+        self.grounding_score = grounding_score
 
     def to_dict(self) -> dict:
         return {
@@ -123,6 +125,7 @@ class ContentVariant:
             "score": self.score,
             "score_breakdown": self.score_breakdown,
             "hook": self.hook,
+            "grounding_score": self.grounding_score,
         }
 
 

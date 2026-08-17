@@ -37,11 +37,16 @@ class Settings(BaseSettings):
     ]
 
     # LLM (used by idea_generation, repurpose_engine, viral_analytics)
-    llm_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    llm_base_url: str = "https://llm-k189xkia71r72n1w.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
     llm_api_key: str = ""
     llm_model: str = "qwen-latest-series-invite-beta-v34"
     llm_timeout: int = 60
     llm_max_retries: int = 5
+    llm_enable_thinking: bool = True
+
+    # Alerts
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     # SSH (3090 server for SearXNG / Firecrawl)
     ssh_host: str = "3090-lan"
@@ -65,3 +70,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# ─── Loopback Detection ──────────────────────────────────────────────────────
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def is_loopback(host: str) -> bool:
+    """Check if a host string is a loopback address."""
+    return host in LOOPBACK_HOSTS

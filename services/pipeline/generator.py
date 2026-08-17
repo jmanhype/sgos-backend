@@ -77,6 +77,8 @@ class LLMVariantGenerator:
             client = OpenAI(
                 base_url=settings.llm_base_url,
                 api_key=settings.llm_api_key,
+                max_retries=settings.llm_max_retries,
+                timeout=settings.llm_timeout,
             )
 
             # Pick variant types to generate
@@ -88,7 +90,15 @@ class LLMVariantGenerator:
 
             voice_section = f"\n\nVoice/Style Guide:\n{voice_prompt}" if voice_prompt else ""
 
-            prompt = f"""You are a viral content strategist. Analyze this viral genome and create {num_variants} content pieces that structurally mirror what made it go viral — but with YOUR unique angle.
+            # Extract source content for grounding (prevent hallucination)
+            source_content = ""
+            if genome.raw_post:
+                source_title = genome.raw_post.get("title", "")
+                source_body = genome.raw_post.get("content", "")
+                source_url = genome.raw_post.get("url", "")
+                source_content = f"\n\n## Source Material (GROUND ALL CLAIMS IN THIS)\n- Title: {source_title}\n- Content: {source_body[:800]}\n- URL: {source_url}"
+
+            prompt = f"""You are a viral content strategist. Analyze this viral genome and create {num_variants} content pieces that structurally mirror what made it go viral — with YOUR unique angle on the SAME topic.
 
 ## Source Viral Genome
 - Hook Type: {genome.hook_type}
@@ -100,15 +110,17 @@ class LLMVariantGenerator:
 - Source Score: {genome.platform_signals.get('score', 0)} upvotes
 - Z-Score: {genome.platform_signals.get('z_score', 0):.1f}
 {voice_section}
+{source_content}
+
+## CRITICAL RULES
+1. **STAY ON TOPIC**: Write about the SAME subject as the source material above. Do NOT invent a different topic.
+2. **NO FABRICATED CLAIMS**: Every specific claim (product names, features, numbers, quotes) must come from the source material or be verifiable public knowledge. Do NOT invent product names, features, or technical details.
+3. **Mirror STRUCTURE, not words**: Use the same hook type, emotional arc, and structural pattern — but with your own voice and angle.
+4. **Skepticism earns trust**: Include at least one "but let's be honest" moment that acknowledges limitations or risks.
+5. **Each piece must be COMPLETE and ready to publish**
 
 ## Generate These {num_variants} Formats
 {type_instructions}
-
-## Rules
-- Mirror the STRUCTURE, not the CONTENT of the original
-- Use the same hook type and emotional arc
-- Each piece must be COMPLETE and ready to publish
-- Include the exact hook as the opening line of each piece
 
 ## Output Format (JSON array)
 Respond with a JSON array of objects:
@@ -127,6 +139,7 @@ Respond with a JSON array of objects:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
                 max_tokens=3000,
+                extra_body={"enable_thinking": True},
             )
 
             raw = response.choices[0].message.content.strip()

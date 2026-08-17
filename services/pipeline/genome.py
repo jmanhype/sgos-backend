@@ -48,6 +48,8 @@ class LLMGenomeExtractor:
             client = OpenAI(
                 base_url=settings.llm_base_url,
                 api_key=settings.llm_api_key,
+                max_retries=settings.llm_max_retries,
+                timeout=settings.llm_timeout,
             )
 
             title = post.get("title", "")
@@ -76,6 +78,7 @@ Respond in JSON only:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=500,
+                extra_body={"enable_thinking": True},
             )
 
             raw = response.choices[0].message.content.strip()

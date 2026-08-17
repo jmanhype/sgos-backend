@@ -18,7 +18,6 @@ class VoiceService:
             "SELECT content, title, platform FROM posts WHERE author=? AND LENGTH(content) > 30",
             (name,),
         ).fetchall()
-        conn.close()
 
         if not rows:
             return None
