@@ -6,10 +6,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Minimal system deps (openssh-client needed for the H3 pipeline's SSH/SCP to 3090)
+# Minimal system deps (openssh-client for H3 SSH/SCP, ffmpeg for video QC)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     openssh-client \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps
