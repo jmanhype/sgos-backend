@@ -636,8 +636,15 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
         # Run QC review (non-blocking for the pipeline; failures don't affect file delivery)
         try:
             vid_meta = _extract_video_meta(dest)
-            qc_result = await _qc_review_video(dest, vid_meta, production_id)
-            print(f"[QC] Final score for {production_id}: {qc_result['score']}/10", flush=True)
+            qc_result = await _qc_review_video(dest, vid_meta, production_id, metadata=reg_meta)
+            score = qc_result.get("score")
+            print(f"[QC] Final score for {production_id}: {score}/10", flush=True)
+            # Persist reroll feedback on the sidecar + row so run_production_cycle can act on it.
+            reg_meta.setdefault("qc_score", score)
+            reg_meta.setdefault("reroll_recommended", qc_result.get("reroll_recommended", False))
+            reg_meta.setdefault("prompt_improvements", qc_result.get("prompt_improvements") or [])
+            reg_meta.setdefault("reroll_count", reg_meta.get("reroll_count", 0))
+            await asyncio.to_thread(write_meta_sidecar, dest, reg_meta)
         except Exception as qc_exc:
             print(f"[QC] QC review failed (non-fatal): {qc_exc}", flush=True)
             logger.warning(f"_finalize_media: QC review failed: {qc_exc}")
@@ -647,6 +654,66 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
         print(f"[STORE] Registration FAILED: {exc}", flush=True)
         logger.error(f"_finalize_media: store write failed: {exc}")
         return None
+
+
+def _read_reroll_feedback(dest: Path) -> dict:
+    """Best-effort read of reroll feedback from a media file's .meta.json sidecar.
+
+    Returns {reroll_recommended: bool, prompt_improvements: list}.
+    """
+    try:
+        sidecar = dest.with_suffix(dest.suffix + ".meta.json")
+        if not sidecar.exists():
+            return {"reroll_recommended": False, "prompt_improvements": []}
+        data = json.loads(sidecar.read_text())
+        return {
+            "reroll_recommended": bool(data.get("reroll_recommended", False)),
+            "prompt_improvements": data.get("prompt_improvements") or [],
+        }
+    except Exception as exc:
+        logger.warning(f"_read_reroll_feedback: {exc}")
+        return {"reroll_recommended": False, "prompt_improvements": []}
+
+
+def _build_improved_premise(original: str, improvements: list) -> str:
+    """Append each prompt improvement as a sentence to the original premise."""
+    parts = [original] if original else []
+    for imp in improvements:
+        text = str(imp).strip()
+        if not text:
+            continue
+        if not text.endswith("."):
+            text += "."
+        parts.append(text[0].upper() + text[1:])
+    return " ".join(parts)
+
+
+async def _collect_reroll_improvements(video_paths: list) -> list:
+    """Read each produced video's .meta.json sidecar for reroll feedback.
+
+    Returns a de-duplicated list of prompt_improvements if ANY produced video
+    has reroll_recommended=True and a non-empty improvements list; else [].
+    """
+    seen: set = set()
+    combined: list = []
+    for vp in video_paths:
+        if not vp:
+            continue
+        try:
+            feedback = await asyncio.to_thread(_read_reroll_feedback, Path(vp))
+        except Exception as exc:
+            logger.warning(f"_collect_reroll_improvements: read failed for {vp}: {exc}")
+            continue
+        # Only consider this video's feedback if QC recommended a reroll.
+        if not feedback.get("reroll_recommended"):
+            continue
+        for imp in feedback.get("prompt_improvements") or []:
+            text = str(imp).strip()
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                combined.append(text)
+    return combined
 
 
 def _extract_video_meta(path: Path) -> dict:
@@ -772,29 +839,193 @@ def _qc_local_check(video_path: Path, vid_meta: dict) -> dict:
     return {"score": score, "notes": notes}
 
 
+async def _qc_video_modelscope(video_path: Path, metadata: dict) -> Optional[dict]:
+    """QC a video via ModelScope Qwen3.8-Max vision API.
+
+    Re-encodes to ≤8MB at 320p, base64 encodes, sends structured QC prompt.
+    Returns parsed {motion_quality, temporal_coherence, style_adherence,
+    artifacts, overall_watchability, summary} or None on any failure.
+    Never raises — all errors are logged and return None.
+    """
+    import base64
+    import subprocess as _sp
+
+    api_key = os.environ.get("MODELSCOPE_API_KEY", "")
+    if not api_key:
+        print("[QC-MS] MODELSCOPE_API_KEY not set — skipping ModelScope QC", flush=True)
+        return None
+
+    # Step 1: Re-encode to ≤8MB at 320p
+    small_path = video_path.parent / f".qc_{video_path.stem}_small.mp4"
+    print(f"[QC-MS] Re-encoding {video_path.name} to 320p for ModelScope...", flush=True)
+    try:
+        r = _sp.run(
+            ["ffmpeg", "-y", "-i", str(video_path),
+             "-vf", "scale=320:-2", "-c:v", "libx264", "-preset", "fast",
+             "-crf", "30", "-c:a", "aac", "-b:a", "96k", str(small_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0 or not small_path.exists():
+            print(f"[QC-MS] Re-encode failed: {r.stderr[:200]}", flush=True)
+            return None
+        small_size = small_path.stat().st_size
+        print(f"[QC-MS] Re-encoded: {small_size:,} bytes ({small_size/1024/1024:.1f}MB)", flush=True)
+        if small_size > 8_000_000:
+            print(f"[QC-MS] Still too large ({small_size:,}b), trying CRF 35...", flush=True)
+            r = _sp.run(
+                ["ffmpeg", "-y", "-i", str(video_path),
+                 "-vf", "scale=240:-2", "-c:v", "libx264", "-preset", "fast",
+                 "-crf", "35", "-c:a", "aac", "-b:a", "64k", str(small_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode != 0 or not small_path.exists() or small_path.stat().st_size > 8_000_000:
+                print(f"[QC-MS] Could not reduce to ≤8MB — skipping ModelScope QC", flush=True)
+                return None
+            small_size = small_path.stat().st_size
+            print(f"[QC-MS] Second pass: {small_size:,} bytes", flush=True)
+    except Exception as e:
+        print(f"[QC-MS] Re-encode error: {e}", flush=True)
+        return None
+
+    # Step 2: Base64 encode
+    try:
+        with open(small_path, "rb") as f:
+            b64_video = base64.b64encode(f.read()).decode("ascii")
+        print(f"[QC-MS] Base64 encoded: {len(b64_video):,} chars", flush=True)
+    except Exception as e:
+        print(f"[QC-MS] Base64 encode error: {e}", flush=True)
+        return None
+    finally:
+        # Clean up temp file
+        try:
+            small_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Step 3: Build QC prompt with context
+    premise = metadata.get("premise", "unknown")
+    style = metadata.get("style_id", "unknown")
+    engine = metadata.get("engine", "unknown")
+    qc_prompt = (
+        f"You are a professional video quality reviewer. Analyze this AI-generated video.\n\n"
+        f"INTENDED CONTENT:\n"
+        f"- Engine: {engine}\n"
+        f"- Style: {style}\n"
+        f"- Premise: {premise}\n\n"
+        f"Respond with ONLY valid JSON (no markdown fences):\n"
+        f'{{\n'
+        f'  "motion_quality": {{"score": 0-10, "notes": "smoothness, jitter, motion artifacts"}},\n'
+        f'  "temporal_coherence": {{"score": 0-10, "notes": "scene consistency, morphing, teleportation"}},\n'
+        f'  "style_adherence": {{"score": 0-10, "notes": "matches intended aesthetic/style"}},\n'
+        f'  "artifacts": ["list of specific visual defects observed"],\n'
+        f'  "overall_watchability": 0-10,\n'
+        f'  "reroll_recommended": true/false,  // true only if a reroll is likely to materially improve quality\n'
+        f'  "prompt_improvements": ["specific, actionable prompt changes to improve this video, one per element"],\n'
+        f'  "summary": "one paragraph overall assessment"\n'
+        f'}}'
+    )
+
+    # Step 4: Call ModelScope API
+    payload = {
+        "model": "Qwen-Ambassador/Qwen3.8-Max",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64_video}"}},
+                {"type": "text", "text": qc_prompt},
+            ],
+        }],
+        "max_tokens": 2048,
+        "temperature": 0.3,
+    }
+
+    print(f"[QC-MS] Sending to ModelScope Qwen3.8-Max...", flush=True)
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                "https://api-inference.modelscope.ai/v1/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            if resp.status_code != 200:
+                print(f"[QC-MS] API returned {resp.status_code}: {resp.text[:200]}", flush=True)
+                return None
+            data = resp.json()
+    except httpx.TimeoutException:
+        print("[QC-MS] API timed out (300s)", flush=True)
+        return None
+    except Exception as e:
+        print(f"[QC-MS] API request error: {e}", flush=True)
+        return None
+
+    # Step 5: Parse response
+    content = ""
+    try:
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        # Strip markdown fences if present
+        import re
+        content = re.sub(r'^```(?:json)?\s*', '', content.strip())
+        content = re.sub(r'\s*```$', '', content.strip())
+        result = json.loads(content)
+        print(f"[QC-MS] Parsed QC result: watchability={result.get('overall_watchability')}", flush=True)
+        return result
+    except (json.JSONDecodeError, IndexError, KeyError) as e:
+        print(f"[QC-MS] Failed to parse response: {e}", flush=True)
+        print(f"[QC-MS] Raw content[:300]: {content[:300]}", flush=True)
+        return None
+
+
 async def _qc_review_video(
     video_path: Path,
     vid_meta: dict,
     production_id: str,
+    metadata: Optional[dict] = None,
 ) -> dict:
     """Run QC review on a production video.
 
-    Currently uses local checks only. External vision API can be added later.
+    Two-tier: local sanity checks first, then ModelScope vision QC if available.
     Updates the production record with qc_score and qc_notes.
     Returns {score, notes}.
     """
+    metadata = metadata or {}
     print(f"[QC] Starting QC review for {production_id}: {video_path.name}", flush=True)
 
-    # Local checks (always run)
+    # Tier 1: Local checks (always run)
     result = _qc_local_check(video_path, vid_meta)
     score = result["score"]
     notes = result["notes"]
 
-    # Extract frames for future vision QC (also validates video is readable)
+    # Extract frames (validates video is readable + future manual review)
     frames_dir = video_path.parent / f".qc_{video_path.stem}"
     frames = await asyncio.to_thread(_extract_qc_frames, video_path, frames_dir)
     if frames:
         notes += f"; {len(frames)} QC frames extracted"
+
+    # Tier 2: ModelScope vision QC (if API key available and local checks passed)
+    ms_result = None
+    if score >= 5.0:  # Only send to ModelScope if not obviously broken
+        try:
+            ms_result = await _qc_video_modelscope(video_path, metadata)
+            if ms_result:
+                ms_score = ms_result.get("overall_watchability", score)
+                ms_summary = ms_result.get("summary", "")
+                ms_artifacts = ms_result.get("artifacts", [])
+                # Blend: use ModelScope score as primary, local as sanity floor
+                score = max(ms_score, min(score, 5.0))  # MS score, but local failures cap at 5
+                artifact_str = "; ".join(ms_artifacts[:5]) if ms_artifacts else "none noted"
+                notes = (
+                    f"ModelScope QC: {ms_score}/10 — {ms_summary}; "
+                    f"Artifacts: {artifact_str}; "
+                    f"Local: {result['notes']}"
+                )
+                print(f"[QC] ModelScope score: {ms_score}/10, blended: {score}/10", flush=True)
+            else:
+                print("[QC] ModelScope unavailable — using local QC only", flush=True)
+        except Exception as ms_exc:
+            print(f"[QC] ModelScope QC failed (non-fatal): {ms_exc}", flush=True)
 
     # Update DB with QC results
     try:
@@ -805,24 +1036,34 @@ async def _qc_review_video(
             (score, notes, production_id),
         )
         conn.commit()
-        print(f"[QC] Updated {production_id}: score={score}, notes={notes}", flush=True)
+        print(f"[QC] Updated {production_id}: score={score}", flush=True)
     except Exception as e:
         print(f"[QC] Failed to update DB for {production_id}: {e}", flush=True)
         logger.error(f"_qc_review_video: DB update failed: {e}")
 
     logger.info(f"_qc_review_video: {production_id} score={score}")
-    return {"score": score, "notes": notes}
+    return {
+        "score": score,
+        "notes": notes,
+        "reroll_recommended": bool((ms_result or {}).get("reroll_recommended", False)),
+        "prompt_improvements": (ms_result or {}).get("prompt_improvements") or [],
+    }
 
 
 async def run_production_cycle(config: dict) -> dict:
     """Run one full production: pick -> brief -> H3 + Flux3 -> poll -> download -> log.
 
-    config keys: style_id/franchise/premise/niche overrides; output_dir.
+    config keys: style_id/franchise/premise/niche overrides; output_dir; reroll_count.
+
+    Auto-reroll: if QC on the produced videos returns reroll_recommended=True with
+    a non-empty prompt_improvements list AND this isn't already a reroll, the cycle
+    re-runs once with an improved premise (capped at 1 reroll per production).
     """
+    reroll_count = int(config.get("reroll_count", 0) or 0)
     print(f"[FACTORY] run_production_cycle starting with config keys: {list(config.keys())}", flush=True)
     pick = (
         await asyncio.to_thread(pick_next_production) if not config.get("style_id")
-        else config
+        else dict(config)
     )
     print(f"[FACTORY] pick complete: style={pick.get('style_id')}, franchise={pick.get('franchise')}", flush=True)
 
@@ -847,6 +1088,7 @@ async def run_production_cycle(config: dict) -> dict:
     # Kick off H3 + Flux3 concurrently (return_exceptions so one failure
     # doesn't cancel the other). Pass the pick metadata for registration.
     provenance = {k: pick.get(k, "") for k in ("style_id", "franchise", "premise", "niche")}
+    provenance["reroll_count"] = reroll_count
     h3_task = asyncio.create_task(_submit_and_poll_h3(brief, out_dir, provenance))
     flux_task = asyncio.create_task(_send_and_poll_flux(brief, out_dir, provenance))
 
@@ -873,6 +1115,7 @@ async def run_production_cycle(config: dict) -> dict:
         "flux3_video": flux3_video,
         "qc_status": qc_status,
         "failure_reason": failure_reason,
+        "reroll_count": reroll_count,
     }
     # Primary path: production store. Fallback to the JSON log if it fails.
     try:
@@ -881,8 +1124,26 @@ async def run_production_cycle(config: dict) -> dict:
         logger.error(f"run_production_cycle: store register failed, falling back to log: {exc}")
         _append_log(entry)
 
-    return {"h3_video": h3_video, "flux3_video": flux3_video,
-            "brief": brief_resp, "qc_status": qc_status}
+    result = {"h3_video": h3_video, "flux3_video": flux3_video,
+              "brief": brief_resp, "qc_status": qc_status, "reroll_count": reroll_count}
+
+    # ── Auto-reroll: use QC feedback (max 1 reroll per production) ─────────────
+    if reroll_count >= 1:
+        return result
+
+    improvements = await _collect_reroll_improvements([h3_video, flux3_video])
+    if improvements:
+        improved = _build_improved_premise(pick.get("premise", ""), improvements)
+        print(f"[REROLL] Attempting reroll with improved prompt: {improvements}", flush=True)
+        logger.info(f"[REROLL] Attempting reroll with improved prompt: {improvements}")
+        reroll_config = dict(config)
+        reroll_config.update({"premise": improved, "reroll_count": 1})
+        reroll_result = await run_production_cycle(reroll_config)
+        reroll_result["rerolled_from"] = pick.get("premise", "")
+        reroll_result["reroll_improvements"] = improvements
+        return reroll_result
+
+    return result
 
 
 # H3 status polling cadence over the bridge (submit -> status every 15s).
@@ -1049,6 +1310,7 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path, provenance: Optional[d
         "prompt": (raw_job or {}).get("prompt", ""),
         "render_duration_s": render_duration_s,
         "resolution": vid_meta.get("resolution"),
+        "reroll_count": provenance.get("reroll_count", 0),
         "duration_s": vid_meta.get("duration_s"),
     }
     finalized = await _finalize_media(final_dest, reg_meta)
@@ -1154,6 +1416,7 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[d
         "prompt": prompt,
         "resolution": vid_meta.get("resolution"),
         "duration_s": vid_meta.get("duration_s"),
+        "reroll_count": provenance.get("reroll_count", 0),
     }
     finalized = await _finalize_media(final_dest, reg_meta)
     if not finalized:
