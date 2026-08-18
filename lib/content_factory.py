@@ -1050,6 +1050,148 @@ async def _qc_review_video(
     }
 
 
+def _validate_prompt_context(prompt: str, engine: str) -> list[str]:
+    """Check if dialogue in a prompt is contextually appropriate for the visual scene.
+
+    Returns a list of warning strings. Never modifies the prompt — the QC→reroll
+    loop handles improvements via ModelScope feedback.
+    """
+    import re
+    warnings: list[str] = []
+
+    # Extract quoted dialogue (both single and double quotes)
+    dialogue_matches = re.findall(r'"([^"]{3,})"|\'([^\']{3,})\'', prompt)
+    dialogues = [m[0] or m[1] for m in dialogue_matches]
+
+    # Extract <d> tag content for H3
+    d_tag_matches = re.findall(r'<d>\[[^\]]*\]([^<]+)</d>', prompt)
+    dialogues.extend(d_tag_matches)
+
+    if not dialogues:
+        return warnings  # No dialogue to check
+
+    # Extract visual keywords from the non-dialogue parts of the prompt
+    # Remove dialogue text and <d> tags to get the visual description
+    visual_text = re.sub(r'<d>[^<]*</d>', '', prompt)
+    for d in dialogues:
+        visual_text = visual_text.replace(f'"{d}"', '').replace(f"'{d}'", "")
+    visual_text = visual_text.lower()
+
+    # Simple heuristic: extract nouns/keywords from visual description
+    # and check if any dialogue word overlaps with the visual context
+    visual_words = set(re.findall(r'[a-z]{3,}', visual_text))
+    # Common visual categories that dialogue should relate to
+    scene_indicators = {
+        "robot", "mech", "kaiju", "godzilla", "monster", "dragon", "alien",
+        "city", "tokyo", "street", "building", "tower", "bridge", "harbor",
+        "car", "truck", "vehicle", "drive", "chase", "highway", "road",
+        "school", "classroom", "graduation", "campus", "student",
+        "kitchen", "cook", "food", "restaurant", "chef", "recipe",
+        "fight", "battle", "punch", "kick", "sword", "weapon", "attack",
+        "sunset", "sunrise", "night", "rain", "snow", "storm", "fire",
+        "dance", "music", "sing", "concert", "stage", "perform",
+        "hangar", "launch", "fly", "space", "ship", "rocket", "pilot",
+        "beach", "ocean", "wave", "surf", "boat", "island",
+        "forest", "tree", "mountain", "river", "field", "garden",
+        "party", "celebration", "birthday", "wedding", "funeral",
+        "hospital", "doctor", "nurse", "patient", "clinic",
+        "barbershop", "salon", "haircut", "mirror",
+    }
+    # Find which scene indicators appear in the visual description
+    # Use stem matching to handle plurals (streets→street, cars→car)
+    active_scene = set()
+    for word in visual_words:
+        stem = word.rstrip("s") if word.endswith("s") and len(word) > 3 else word
+        if stem in scene_indicators or word in scene_indicators:
+            active_scene.add(stem if stem in scene_indicators else word)
+
+    if not active_scene:
+        # Can't determine scene context — skip contextual check
+        return warnings
+
+    # Check each dialogue line for relevance to the visual scene
+    for dialogue in dialogues:
+        dialogue_words = set(re.findall(r'[a-z]{3,}', dialogue.lower()))
+        # Stem dialogue words too for matching
+        dialogue_stems = set()
+        for w in dialogue_words:
+            stem = w.rstrip("s") if w.endswith("s") and len(w) > 3 else w
+            dialogue_stems.add(stem)
+        # Check overlap with visual words OR scene indicators
+        overlap = dialogue_stems & (visual_words | active_scene | scene_indicators)
+        has_relation = len(overlap) >= 1
+
+        if not has_relation:
+            visual_summary = ", ".join(sorted(active_scene)[:5])
+            warnings.append(
+                f'Dialogue may not match visual context: "{dialogue[:60]}" '
+                f'in scene about {visual_summary}'
+            )
+
+    # For H3: also check <d> tag formatting
+    if engine == "h3":
+        bare_quotes = re.findall(r'"[^"]{5,}"', prompt)
+        if bare_quotes and not d_tag_matches:
+            warnings.append(
+                f"H3 prompt has {len(bare_quotes)} quoted strings without <d> tags — "
+                f"dialogue may not render as speech"
+            )
+        bad_d_tags = re.findall(r'<d>(?!\[)([^<]+)</d>', prompt)
+        if bad_d_tags:
+            warnings.append(
+                f"H3 prompt has {len(bad_d_tags)} <d> tags missing [Language] prefix"
+            )
+
+    return warnings
+
+
+def _validate_prompts(brief: dict) -> dict:
+    """Validate all prompts in a brief before generation. WARN only, never modify.
+
+    Logs warnings for contextual mismatches and formatting issues.
+    The QC→reroll loop handles actual prompt improvements via ModelScope.
+    Returns the brief unchanged.
+    """
+    pp = brief.get("production_prompts", {})
+    if not pp:
+        return brief
+
+    # Validate Flux3 prompt
+    flux3 = pp.get("flux3", "")
+    if flux3:
+        raw = flux3
+        if flux3.startswith("/t2v"):
+            import re
+            m = re.match(r'^/t2v\s+(?:prompt:)?(.*)', flux3, re.DOTALL)
+            if m:
+                raw = m.group(1)
+        warnings = _validate_prompt_context(raw, "flux3")
+        for w in warnings:
+            print(f"[PROMPT_WARN] Flux3: {w}", flush=True)
+            logger.warning(f"_validate_prompts: Flux3: {w}")
+
+    # Validate H3 prompts
+    for key in ("h3_job_json", "h3_multishot_json"):
+        h3_cfg = pp.get(key)
+        if not h3_cfg or not isinstance(h3_cfg, dict):
+            continue
+        prompt = h3_cfg.get("prompt", "")
+        if prompt:
+            warnings = _validate_prompt_context(prompt, "h3")
+            for w in warnings:
+                print(f"[PROMPT_WARN] H3 {key}: {w}", flush=True)
+                logger.warning(f"_validate_prompts: H3 {key}: {w}")
+        # Check multishot shots
+        for shot in h3_cfg.get("shots", []):
+            shot_prompt = shot.get("prompt", "")
+            if shot_prompt:
+                warnings = _validate_prompt_context(shot_prompt, "h3")
+                for w in warnings:
+                    print(f"[PROMPT_WARN] H3 shot {shot.get('shot_index','?')}: {w}", flush=True)
+
+    return brief
+
+
 async def run_production_cycle(config: dict) -> dict:
     """Run one full production: pick -> brief -> H3 + Flux3 -> poll -> download -> log.
 
@@ -1070,6 +1212,9 @@ async def run_production_cycle(config: dict) -> dict:
     brief_resp = await _get_brief(pick)
     brief = brief_resp.get("brief") or {}
     out_dir = Path(config.get("output_dir", str(OUTPUT_DIR)))
+
+    # Pre-generation prompt validation (warn only, never modify)
+    _validate_prompts(brief)
 
     # Dedup guard: warn (but don't block) if this exact production happened recently.
     try:
