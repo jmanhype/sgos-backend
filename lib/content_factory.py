@@ -92,6 +92,30 @@ def _load_visual_register() -> list[dict]:
         return []
 
 
+# Cache the visual register once at module level so the coherence gate (and the
+# picker) don't re-read the file on every production. Container path lives at
+# /app/vbl-data/visual_register.json via the VISUAL_REGISTER env var.
+_STYLES_CACHE: Optional[list[dict]] = None
+
+
+def _styles() -> list[dict]:
+    global _STYLES_CACHE
+    if _STYLES_CACHE is None:
+        _STYLES_CACHE = _load_visual_register()
+    return _STYLES_CACHE
+
+
+def _get_style_guide(style_id: str) -> Optional[dict]:
+    """Return the dialogue_guide for a style_id, or None if not found."""
+    if not style_id:
+        return None
+    for s in _styles():
+        if s.get("id") == style_id:
+            dg = s.get("dialogue_guide")
+            return dg if isinstance(dg, dict) else None
+    return None
+
+
 def _load_franchises() -> list[str]:
     """Franchise/aesthetic names from the lost-futures index.
 
@@ -716,6 +740,83 @@ async def _collect_reroll_improvements(video_paths: list) -> list:
                 seen.add(key)
                 combined.append(text)
     return combined
+
+
+def _validate_prompt_coherence(
+    prompt: str,
+    style_id: str,
+    engine: str,
+    reroll_count: int = 0,
+) -> str:
+    """Pre-generation coherence gate: check drawn-out dialogue matches the scene.
+
+    Uses the style's `dialogue_guide` (tone, examples, banned_phrases) from
+    visual_register.json. NEVER strips dialogue — only APPENDS a coherence hint
+    when banned phrases are detected or tone overlap is low.
+
+    Returns the (possibly hint-appended) prompt string. On reroll (reroll_count>0)
+    we skip appending because the improved premise/improvements already steer the
+    dialogue (avoids double-annotating).
+    """
+    guide = _get_style_guide(style_id)
+    if not guide:
+        return prompt
+
+    banned = [str(b).lower().replace("\u2019", "'").replace("\u2018", "'") for b in (guide.get("banned_phrases") or [])]
+    tone = (guide.get("tone") or "").lower()
+    examples = guide.get("examples") or []
+
+    # Extract quoted dialogue lines (double-quoted, and single-quoted short),
+    # normalizing curly apostrophes so "Y'all" still matches the guide.
+    quoted = re.findall(r'"([^"]{2,})"', prompt) + re.findall(r"'([^']{2,})'", prompt)
+    lines = [q.replace("\u2019", "'").replace("\u2018", "'") for q in quoted if len(q.strip()) > 1]
+    n_lines = len(lines)
+
+    # 1) Banned phrase check.
+    banned_found = 0
+    for line in (l.lower() for l in lines):
+        for b in banned:
+            if b and b in line:
+                banned_found += 1
+                break
+
+    # 2) Tone overlap: does any dialogue token overlap the tone description?
+    if tone:
+        tone_words = set(re.findall(r"[a-z]{3,}", tone))
+        overlap = 0
+        for line in (l.lower() for l in lines):
+            if set(re.findall(r"[a-z]{3,}", line)) & tone_words:
+                overlap += 1
+        tone_overlap_ratio = overlap / n_lines if n_lines else 1.0
+    else:
+        tone_overlap_ratio = 1.0
+
+    low_coherence = (banned_found > 0) or (n_lines > 0 and tone_overlap_ratio < 0.5)
+
+    coherence_hint_appended = False
+    if low_coherence and reroll_count == 0 and lines and tone:
+        example = examples[0] if examples else ""
+        hint = (
+            f"Dialogue should match the {tone} tone of this {style_id} scene."
+        )
+        if banned:
+            hint += f" Avoid: {', '.join(banned)}."
+        if example:
+            hint += f" Example appropriate dialogue: {example}"
+        end = " duration:"
+        if end in prompt:
+            head, _, tail = prompt.partition(end)
+            prompt = f"{head.rstrip('.')}. {hint}.{end}{tail}"
+        else:
+            prompt = f"{prompt.rstrip('.')}. {hint}."
+        coherence_hint_appended = True
+
+    print(
+        f"[COHERENCE] Style={style_id}, engine={engine}, dialogue_lines={n_lines}, "
+        f"banned_found={banned_found}, coherence_hint_appended={coherence_hint_appended}",
+        flush=True,
+    )
+    return prompt
 
 
 def _apply_reroll_to_flux3(brief: dict, improvements: list) -> dict:
@@ -1369,6 +1470,37 @@ async def run_production_cycle(config: dict) -> dict:
             brief = _apply_reroll_to_h3(brief, improvements)
             brief_resp = dict(brief_resp)
             brief_resp["brief"] = brief
+
+    # Pre-generation dialogue-scene coherence gate (append-only, never strips).
+    try:
+        style_id = pick.get("style_id", "")
+        pp = brief.get("production_prompts", {})
+        new_pp = dict(pp)
+        flux3 = pp.get("flux3", "")
+        if flux3:
+            flux3 = _validate_prompt_coherence(flux3, style_id, "flux3", reroll_count)
+            new_pp["flux3"] = flux3
+        for key in ("h3_multishot_json", "h3_job_json"):
+            cfg = pp.get(key)
+            if isinstance(cfg, dict):
+                cfg2 = dict(cfg)
+                if isinstance(cfg2.get("shots"), list):
+                    cfg2["shots"] = [
+                        {**shot, "prompt": _validate_prompt_coherence(
+                            str(shot.get("prompt", "")), style_id, "h3", reroll_count)}
+                        for shot in cfg2["shots"]
+                    ]
+                if "prompt" in cfg2 and isinstance(cfg2.get("prompt"), str):
+                    cfg2["prompt"] = _validate_prompt_coherence(
+                        cfg2["prompt"], style_id, "h3", reroll_count)
+                new_pp[key] = cfg2
+        brief = dict(brief)
+        brief["production_prompts"] = new_pp
+        brief_resp = dict(brief_resp)
+        brief_resp["brief"] = brief
+    except Exception as exc:
+        print(f"[COHERENCE] gate failed (non-fatal): {exc}", flush=True)
+        logger.warning(f"run_production_cycle: coherence gate failed: {exc}")
 
     # Dedup guard: warn (but don't block) if this exact production happened recently.
     try:

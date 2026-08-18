@@ -197,6 +197,24 @@ def init_db():
     except Exception:
         pass
 
+    # QC curation rejects table — structured reject/reroll decisions
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS qc_rejects (
+            id TEXT PRIMARY KEY,
+            production_id TEXT NOT NULL,
+            keep_decision TEXT NOT NULL,
+            failure_class TEXT,
+            severity TEXT,
+            specific_notes TEXT,
+            prompt_patches TEXT,
+            qc_score REAL,
+            reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_qcr_production ON qc_rejects(production_id);
+        CREATE INDEX IF NOT EXISTS idx_qcr_decision ON qc_rejects(keep_decision);
+        CREATE INDEX IF NOT EXISTS idx_qcr_reviewed ON qc_rejects(reviewed_at DESC);
+    """)
+
     # Create FTS5 virtual table if not exists
     try:
         c.execute("""
