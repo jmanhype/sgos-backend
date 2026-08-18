@@ -198,3 +198,104 @@ def serve_video(prod_id: str):
         media_type=content_type,
         filename=full_path.name,
     )
+
+
+@router.get("/{prod_id}/qc")
+def qc_frames(prod_id: str):
+    """Extract 3 QC frames from a production video for vision review.
+
+    Returns frame file paths (at 25%, 50%, 75% of duration) plus production
+    metadata so the agent can visually review each frame against the prompt.
+    Frames are saved next to the video in a .qc_<stem>/ directory.
+    """
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM productions WHERE id = ?", (prod_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Production not found")
+
+    prod = _row_to_dict(row)
+    file_path = prod.get("file_path")
+    if not file_path:
+        raise HTTPException(404, "Production has no video file")
+
+    # Resolve and validate path
+    try:
+        full_path = resolve_video_path(file_path)
+    except ValueError as e:
+        logger.error(f"qc_frames path validation failed for {prod_id}: {e}")
+        raise HTTPException(403, "Access denied")
+
+    if not full_path.exists():
+        raise HTTPException(404, f"Video file not found at {full_path}")
+
+    # Get video duration via ffprobe
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(full_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        import json as _json
+        data = _json.loads(r.stdout or "{}")
+        duration = float(data.get("format", {}).get("duration", 0))
+    except Exception:
+        duration = 0
+
+    if duration <= 0:
+        raise HTTPException(422, "Cannot determine video duration")
+
+    # Extract 3 frames at 25%, 50%, 75%
+    frames_dir = full_path.parent / f".qc_{full_path.stem}"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamps = [
+        ("25pct", duration * 0.25),
+        ("50pct", duration * 0.50),
+        ("75pct", duration * 0.75),
+    ]
+    frames = []
+    for label, ts in timestamps:
+        out = frames_dir / f"{label}_{ts:.1f}s.jpg"
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(full_path),
+                 "-frames:v", "1", "-q:v", "2", str(out)],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                frames.append({
+                    "label": label,
+                    "timestamp_s": round(ts, 2),
+                    "path": str(out),
+                    "size": out.stat().st_size,
+                })
+        except Exception as e:
+            logger.warning(f"qc_frames: extraction failed at {label}: {e}")
+
+    if not frames:
+        raise HTTPException(500, "Failed to extract any frames")
+
+    return {
+        "production_id": prod_id,
+        "video_path": str(full_path),
+        "duration_s": round(duration, 2),
+        "frames": frames,
+        "metadata": {
+            "engine": prod.get("engine"),
+            "style_id": prod.get("style_id"),
+            "franchise": prod.get("franchise"),
+            "premise": prod.get("premise"),
+            "niche": prod.get("niche"),
+            "prompt": prod.get("prompt"),
+            "resolution": prod.get("resolution"),
+            "qc_status": prod.get("qc_status"),
+            "qc_score": prod.get("qc_score"),
+            "generated_at": prod.get("generated_at"),
+        },
+    }
