@@ -1207,13 +1207,26 @@ async def _qc_review_video(
         except Exception as ms_exc:
             print(f"[QC] ModelScope QC failed (non-fatal): {ms_exc}", flush=True)
 
-    # Update DB with QC results
+    # Update DB with QC results.
+    #  - `productions` row (fresh registered id): set qc_score/qc_notes.
+    #  - `factory_jobs` rows (shared lineage id across original + reroll): set
+    #    qc_score/qc_notes so reroll_effectiveness can compare attempts.
     try:
         from database import get_connection
         conn = get_connection()
         conn.execute(
             "UPDATE productions SET qc_score = ?, qc_notes = ? WHERE id = ?",
             (score, notes, production_id),
+        )
+        lineage_id = (metadata or {}).get("production_id") or production_id
+        # Scope to THIS attempt's rows (created within the last ~10 min). Each
+        # production attempt (original vs reroll) runs minutes apart, so this
+        # preserves the first attempt's qc_score instead of overwriting it with
+        # the latest attempt's score on every shared-row update.
+        conn.execute(
+            "UPDATE factory_jobs SET qc_score = ?, qc_notes = ? "
+            "WHERE production_id = ? AND created_at >= datetime('now','-10 minutes')",
+            (score, notes, lineage_id),
         )
         conn.commit()
         print(f"[QC] Updated {production_id}: score={score}", flush=True)
@@ -1762,6 +1775,7 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path, provenance: Optional[d
         "render_duration_s": render_duration_s,
         "resolution": vid_meta.get("resolution"),
         "reroll_count": provenance.get("reroll_count", 0),
+        "production_id": provenance.get("production_id", ""),
         "duration_s": vid_meta.get("duration_s"),
     }
     finalized = await _finalize_media(final_dest, reg_meta)
@@ -1868,6 +1882,7 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[d
         "resolution": vid_meta.get("resolution"),
         "duration_s": vid_meta.get("duration_s"),
         "reroll_count": provenance.get("reroll_count", 0),
+        "production_id": provenance.get("production_id", ""),
     }
     finalized = await _finalize_media(final_dest, reg_meta)
     if not finalized:

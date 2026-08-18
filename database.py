@@ -168,7 +168,9 @@ def init_db():
             render_duration_s REAL,  -- populated for h3/flux3 stages (GPU/render time)
             outcome TEXT,
             reroll_count INTEGER DEFAULT 0,
-            parent_job_id TEXT
+            parent_job_id TEXT,
+            qc_score REAL,
+            qc_notes TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_fj_session ON factory_jobs(session_id);
         CREATE INDEX IF NOT EXISTS idx_fj_engine ON factory_jobs(engine);
@@ -194,6 +196,10 @@ def init_db():
             c.execute("ALTER TABLE factory_jobs ADD COLUMN created_at TIMESTAMP")
         if "render_duration_s" not in fj_cols:
             c.execute("ALTER TABLE factory_jobs ADD COLUMN render_duration_s REAL")
+        if "qc_score" not in fj_cols:
+            c.execute("ALTER TABLE factory_jobs ADD COLUMN qc_score REAL")
+        if "qc_notes" not in fj_cols:
+            c.execute("ALTER TABLE factory_jobs ADD COLUMN qc_notes TEXT")
     except Exception:
         pass
 

@@ -206,29 +206,24 @@ def compute_metrics(conn: sqlite3.Connection, days: int = 7) -> dict:
             if row and row["groups"]:
                 reroll_rate = _round((row["rerolled"] or 0) / row["groups"])
 
-            # reroll_effectiveness: mean score(last attempt) - score(first attempt)
-            # over production groups with >1 attempt and scored attempts.
+            # reroll_effectiveness: mean score(reroll attempt) - score(original)
+            # over production groups that actually rerolled (reroll_count 0 AND 1).
             rows = conn.execute(
                 f"""SELECT production_id,
-                           MIN(created_at) AS first_ts,
-                           MAX(created_at) AS last_ts
-                    FROM factory_jobs WHERE created_at >= ?
+                           MIN(CASE WHEN reroll_count = 0 THEN qc_score END) AS first_score,
+                           MIN(CASE WHEN reroll_count = 1 THEN qc_score END) AS last_score
+                    FROM factory_jobs
+                    WHERE created_at >= ? AND qc_score IS NOT NULL
                     GROUP BY production_id
-                    HAVING COUNT(*) > 1""",
+                    HAVING COUNT(DISTINCT reroll_count) > 1""",
                 (cutoff,),
             ).fetchall()
             deltas = []
             for g in rows:
-                first = conn.execute(
-                    "SELECT qc_score FROM factory_jobs WHERE production_id=? AND created_at=? ORDER BY rowid LIMIT 1",
-                    (g["production_id"], g["first_ts"]),
-                ).fetchone()
-                last = conn.execute(
-                    "SELECT qc_score FROM factory_jobs WHERE production_id=? AND created_at=? ORDER BY rowid DESC LIMIT 1",
-                    (g["production_id"], g["last_ts"]),
-                ).fetchone()
-                if first and last and first["qc_score"] is not None and last["qc_score"] is not None:
-                    deltas.append(last["qc_score"] - first["qc_score"])
+                first_s = g["first_score"]
+                last_s = g["last_score"]
+                if first_s is not None and last_s is not None:
+                    deltas.append(last_s - first_s)
             if deltas:
                 reroll_effectiveness = _round(sum(deltas) / len(deltas))
 
