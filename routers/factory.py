@@ -1,6 +1,7 @@
 """Autonomous content factory endpoints — start a grind session, poll progress."""
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid
 from typing import Any, Dict, Optional
@@ -376,3 +377,14 @@ async def curate_production(production_id: str):
         pass
 
     return {"production_id": production_id, "verdict": verdict, "reviewed_at": now}
+
+
+@router.get("/references/{franchise}")
+async def list_franchise_references(franchise: str):
+    """List all reference images for a franchise."""
+    try:
+        from lib.reference_manager import list_references
+        refs = await asyncio.to_thread(list_references, franchise=franchise)
+        return {"franchise": franchise, "count": len(refs), "references": refs}
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to list references: {exc}")

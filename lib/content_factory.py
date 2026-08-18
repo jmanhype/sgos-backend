@@ -385,11 +385,15 @@ def _convert_to_wgp_format(job: dict) -> dict:
     return out
 
 
-async def _send_flux3(brief: dict) -> dict:
+async def _send_flux3(brief: dict, tag: Optional[str] = None) -> dict:
     """Navigate ego-bridge to #gen-1 and send the Flux3 /t2v command.
 
     Returns dict with 'sent' (bool) and optionally 'message_id' (str) of the
     sent message for targeted reply tracking.
+
+    When `tag` (e.g. '[SGOS:d1ec'] is provided it is appended to the command
+    text so Discord's message content carries a unique per-production marker
+    for deterministic result matching during polling.
     """
     inner = brief.get("brief", brief)
     pp = inner.get("production_prompts", {})
@@ -397,6 +401,9 @@ async def _send_flux3(brief: dict) -> dict:
     if not flux3_cmd:
         logger.error("_send_flux3: no flux3 prompt in brief production_prompts")
         return {"sent": False}
+    if tag:
+        flux3_cmd = f"{flux3_cmd} {tag}"
+        logger.info(f"_send_flux3: appended production tag {tag} to Flux3 command")
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             await client.post(f"{EGO_BRIDGE_URL}/v1/navigate",
@@ -539,30 +546,95 @@ def _reply_cdn_js(message_id: Optional[str] = None) -> str:
         return _cdn_js()
 
 
+def _tag_cdn_js(tag: str) -> str:
+    """JS to collect CDN mp4 URLs from messages whose content contains `tag`.
+
+    Deterministic result matching (GAP 9): only videos attached to messages that
+    carry our unique `[SGOS:xxxx]` production tag are returned. Uses an exact
+    substring match (bracket-safe) so we never grab another production's video.
+    """
+    # Escape for: single string literal inside JS; backslash-escape apostrophes.
+    safe_tag = tag.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+    return (
+        "(()=>{"
+        f"const tag='{safe_tag}';"
+        "const allEls=[...document.querySelectorAll('li[id],div[id]')];"
+        "const msgEls=allEls.filter(e=>/\\d{17,20}$/.test(e.id));"
+        "const matched=[]; let tagMsgs=0;"
+        "msgEls.forEach(m=>{"
+        "  const text=m.textContent||'';"
+        "  if(!text.includes(tag))return;"
+        "  tagMsgs++;"
+        "  m.querySelectorAll('video source, video[src]').forEach(v=>{"
+        "    const s=(v.currentSrc||v.src||'').split('?')[0];"
+        "    if(s.includes('cdn.discordapp.com')&&s.includes('.mp4'))matched.push(s);"
+        "  });"
+        "});"
+        "return JSON.stringify({tagged:[...new Set(matched)], msgCount:tagMsgs});"
+        "})()"
+    )
+
+
 async def _poll_flux3(
     seen_urls: Optional[set] = None,
     message_id: Optional[str] = None,
+    tag: Optional[str] = None,
 ) -> Optional[str]:
     """Poll Discord for result.mp4 CDN url from Flux3 bot.
 
-    Primary mode (message_id set): looks for result_A/result_B mp4 files in
-    messages referencing our message_id, plus tracks new URLs vs baseline.
-    Fallback mode (message_id None): scans all new video URLs vs baseline.
+    GAP 9 tag-matching (primary when `tag` set): find messages whose content
+    contains the unique `[SGOS:xxxx]` tag and accept videos ONLY from those
+    messages. Deterministic — never grabs another production's video.
+
+    Fallback (when `tag` is None OR no tagged match after max_polls): the
+    existing targeted (message_id) / baseline (newest-unmatched) behaviour, with
+    a WARNING logged whenever the non-tagged fallback is used.
 
     Polls every FLUX_POLL_INTERVAL (15s) for up to ~5 minutes.
     Returns the full signed CDN URL, or None on timeout.
     """
     seen = set(seen_urls or set())
     mode = "targeted" if message_id else "baseline"
-    print(f"[FLUX3] _poll_flux3: {mode} mode, message_id={message_id}, baseline_seen={len(seen)}", flush=True)
+    mode = f"tag({tag})" if tag else mode
+    print(f"[FLUX3] _poll_flux3: {mode} mode, tag={tag}, message_id={message_id}, baseline_seen={len(seen)}", flush=True)
     logger.info(
         f"_poll_flux3: {mode} mode, polling every {FLUX_POLL_INTERVAL}s, "
-        f"up to {FLUX_POLL_ATTEMPTS} attempts"
-        + (f"; message_id={message_id}" if message_id else f"; baseline seen={len(seen)} urls")
+        f"up to {FLUX_POLL_ATTEMPTS} attempts, tag={tag}"
     )
     async with httpx.AsyncClient(timeout=30) as client:
         for attempt in range(1, FLUX_POLL_ATTEMPTS + 1):
             try:
+                # Priority: tag-matched messages when a tag is set.
+                if tag:
+                    js = _tag_cdn_js(tag)
+                    r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js})
+                    raw = (r.json().get("result") or "").strip()
+                    try:
+                        data = json.loads(raw)
+                        tagged = data.get("tagged", [])
+                        msg_count = data.get("msgCount", 0)
+                        # Accept ONLY videos from messages carrying our tag.
+                        new_tagged = [u for u in tagged if u not in seen]
+                        print(
+                            f"[FLUX3] tag attempt {attempt}: tag_msgs={msg_count}, "
+                            f"tagged_videos={len(tagged)}, new_tagged={len(new_tagged)}",
+                            flush=True,
+                        )
+                        logger.info(
+                            f"_poll_flux3: tag={tag} attempt {attempt}/{FLUX_POLL_ATTEMPTS} "
+                            f"tag_msgs={msg_count} tagged_videos={len(tagged)} new_tagged={len(new_tagged)}"
+                        )
+                        if new_tagged:
+                            full = new_tagged[-1]
+                            print(f"[FLUX3] TAG-MATCH RESULT: {full}", flush=True)
+                            logger.info(f"_poll_flux3: TAG-MATCH result for {tag}: {full}")
+                            return full
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"[FLUX3] tag attempt {attempt} parse error: {e}", flush=True)
+                        logger.warning(f"_poll_flux3: tag response parse failed: {e}")
+
+                # Existing targeted/baseline logic (unchanged) — still used for
+                # the no-tag path and as the final non-tagged fallback.
                 js = _reply_cdn_js(message_id)
                 r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js})
                 raw = (r.json().get("result") or "").strip()
@@ -592,6 +664,11 @@ async def _poll_flux3(
                             full = new_targeted[-1]
                             print(f"[FLUX3] TARGETED RESULT: {full}", flush=True)
                             logger.info(f"_poll_flux3: targeted result: {full}")
+                            if tag:
+                                logger.warning(
+                                    f"_poll_flux3: accepted targeted URL WITHOUT tag match "
+                                    f"(non-tagged fallback, tag={tag}): {full}"
+                                )
                             return full
                         # Priority 2: any new URL not in baseline (catches result_A/B even without reply match)
                         new_all = [u for u in all_urls if u not in seen]
@@ -616,6 +693,11 @@ async def _poll_flux3(
                         full = new[-1]
                         print(f"[FLUX3] BASELINE RESULT: {full}", flush=True)
                         logger.info(f"_poll_flux3: baseline result: {full}")
+                        if tag:
+                            logger.warning(
+                                f"_poll_flux3: NO TAG MATCH after attempt {attempt}; "
+                                f"falling back to newest unmatched video (tag={tag}): {full}"
+                            )
                         return full
             except Exception as exc:
                 print(f"[FLUX3] attempt {attempt} error: {exc}", flush=True)
@@ -625,7 +707,7 @@ async def _poll_flux3(
     # If targeted mode failed, try one final baseline sweep
     if message_id:
         print("[FLUX3] targeted mode exhausted, trying final baseline sweep", flush=True)
-        logger.warning("_poll_flux3: targeted mode found nothing, trying baseline fallback")
+        logger.warning(f"_poll_flux3: targeted mode found nothing, trying baseline fallback (tag={tag})")
         try:
             baseline_seen = await _collect_cdn_urls()
         except Exception:
@@ -800,6 +882,20 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
         except Exception as cur_exc:
             print(f"[CURATOR] Inline curation failed (non-fatal): {cur_exc}", flush=True)
             logger.warning(f"_finalize_media: inline curation failed: {cur_exc}")
+
+        # GAP 10: Bootstrap reference from high-scoring production
+        try:
+            from lib.reference_manager import bootstrap_from_production
+            franchise = reg_meta.get("franchise", "")
+            qc_score_val = reg_meta.get("qc_score") or reg_meta.get("qc_score", 0)
+            if franchise and qc_score_val and qc_score_val >= 7.0:
+                ref_id = await asyncio.to_thread(
+                    bootstrap_from_production, dest, franchise, qc_score_val
+                )
+                if ref_id:
+                    print(f"[REF] Bootstrapped aesthetic ref for {franchise}: {ref_id}", flush=True)
+        except Exception as boot_exc:
+            logger.warning(f"_finalize_media: bootstrap ref failed (non-fatal): {boot_exc}")
 
         return str(dest)
     except Exception as exc:
@@ -1965,6 +2061,21 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path, provenance: Optional[d
         logger.error(f"_submit_and_poll_h3: config build failed: {exc}")
         return None
 
+    # GAP 10: Inject reference images for visual anchoring
+    try:
+        from lib.reference_manager import get_refs_for_production
+        franchise = provenance.get("franchise", "") if provenance else ""
+        premise = provenance.get("premise", "") if provenance else ""
+        ref_paths = await asyncio.to_thread(get_refs_for_production, franchise, premise)
+        if ref_paths:
+            existing_refs = wgp_job.get("image_refs") or []
+            merged = list(existing_refs) + [p for p in ref_paths if p not in existing_refs]
+            wgp_job["image_refs"] = merged[:6]  # Cap at 6
+            print(f"[REF] Injected {len(ref_paths)} reference images for {franchise}", flush=True)
+            logger.info(f"_submit_and_poll_h3: injected {len(ref_paths)} refs for {franchise}")
+    except Exception as ref_exc:
+        logger.warning(f"_submit_and_poll_h3: ref injection failed (non-fatal): {ref_exc}")
+
     api_headers = {}
     api_key = os.environ.get("SGOS_API_KEY", "")
     if api_key:
@@ -2113,8 +2224,13 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[d
     with the production store (engine='flux3') using `provenance` metadata.
     """
     provenance = provenance or {}
+    # GAP 9: unique per-production tag -> deterministic result matching.
+    prod_id = provenance.get("production_id", "")
+    tag = f"[SGOS:{prod_id[:8]}]" if prod_id else None
+    if not tag:
+        logger.warning("_send_and_poll_flux: no production_id; running WITHOUT tag-matching")
     try:
-        send_result = await _send_flux3(brief)
+        send_result = await _send_flux3(brief, tag=tag)
     except Exception as exc:
         logger.error(f"_send_and_poll_flux: _send_flux3 raised: {exc}")
         return None
@@ -2124,7 +2240,7 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[d
 
     message_id = send_result.get("message_id")
     if message_id:
-        logger.info(f"_send_and_poll_flux: using targeted tracking with message_id={message_id}")
+        logger.info(f"_send_and_poll_flux: using targeted tracking with message_id={message_id} (tag={tag})")
     else:
         logger.info("_send_and_poll_flux: message_id unavailable, falling back to baseline mode")
 
@@ -2136,7 +2252,7 @@ async def _send_and_poll_flux(brief: dict, out_dir: Path, provenance: Optional[d
         logger.warning(f"_send_and_poll_flux: baseline collection failed: {exc}")
         seen = set()
 
-    url = await _poll_flux3(seen, message_id=message_id)
+    url = await _poll_flux3(seen, message_id=message_id, tag=tag)
     if not url:
         logger.error("_send_and_poll_flux: poll returned no NEW URL")
         return None
