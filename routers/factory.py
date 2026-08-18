@@ -11,7 +11,14 @@ from pydantic import BaseModel, Field
 from database import get_connection
 from lib.content_factory import run_grind_session
 from lib.factory_metrics import compute_metrics
-from lib.meta_optimizer import analyze as run_optimizer, log_proposals
+from lib.meta_optimizer import (
+    analyze as run_optimizer,
+    log_proposals,
+    store_proposals,
+    list_proposals,
+    set_proposal_status,
+    apply_proposal,
+)
 
 router = APIRouter(prefix="/v1/factory", tags=["factory"])
 
@@ -103,17 +110,90 @@ async def factory_optimize(body: OptimizeRequest):
     """Run the meta-optimizer: analyze factory metrics + QC rejects and propose changes.
 
     READ-ONLY: returns versioned improvement proposals but does NOT apply them.
-    Every proposal is logged (structured) for human review before any application.
+    Every proposal is logged (structured) AND stored in the optimizer_proposals
+    review queue (status='pending') for a human to review/approve/reject.
     """
     try:
         conn = get_connection()
         result = run_optimizer(
             conn, days=body.days, thresholds=body.threshold_overrides)
-        # Log proposals for human review (the meta layer never applies them).
+        # Log + queue proposals for human review (the meta layer never auto-applies).
         log_proposals(result.get("proposals", []), result.get("summary", ""))
+        stored_ids = store_proposals(conn, result.get("proposals", []))
+        result["queued_proposal_ids"] = stored_ids
+        result["queued_count"] = len(stored_ids)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"optimize analysis failed: {exc}")
+
+
+@router.get("/proposals")
+async def factory_proposals(status: Optional[str] = Query(None, description="Filter by status (e.g. 'pending')")):
+    """List proposals from the human-review queue, sorted by confidence desc."""
+    try:
+        conn = get_connection()
+        return {"proposals": list_proposals(conn, status=status)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"list proposals failed: {exc}")
+
+
+class ProposalNotes(BaseModel):
+    """Notes attached to a review decision."""
+    reviewer_notes: Optional[str] = Field(default=None, description="Human reviewer notes")
+
+
+@router.post("/proposals/{proposal_id}/approve")
+async def factory_approve_proposal(proposal_id: str, body: Optional[ProposalNotes] = None):
+    """Approve a proposal (no change is applied yet — only status='approved')."""
+    try:
+        conn = get_connection()
+        updated = set_proposal_status(
+            conn, proposal_id, "approved",
+            notes=body.reviewer_notes if body else None)
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"proposal {proposal_id} not found")
+        return {"proposal_id": proposal_id, "status": updated.get("status"), "proposal": updated}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"approve failed: {exc}")
+
+
+@router.post("/proposals/{proposal_id}/reject")
+async def factory_reject_proposal(proposal_id: str, body: Optional[ProposalNotes] = None):
+    """Reject a proposal, recording the reviewer's notes."""
+    try:
+        conn = get_connection()
+        updated = set_proposal_status(
+            conn, proposal_id, "rejected",
+            notes=body.reviewer_notes if body else None)
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"proposal {proposal_id} not found")
+        return {"proposal_id": proposal_id, "status": updated.get("status"), "proposal": updated}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"reject failed: {exc}")
+
+
+@router.post("/proposals/{proposal_id}/apply")
+async def factory_apply_proposal(proposal_id: str):
+    """Apply an APPROVED proposal (writes to the persisted config store, status='applied').
+
+    Only status='approved' proposals can be applied; otherwise a 409 is returned.
+    Logs exactly what was applied for audit/rollback.
+    """
+    try:
+        conn = get_connection()
+        outcome = apply_proposal(conn, proposal_id)
+        return {"proposal_id": proposal_id, "applied": outcome["applied"],
+                "proposal": outcome["proposal"]}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"apply failed: {exc}")
 
 
 @router.get("/curate/{production_id}")

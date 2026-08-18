@@ -5,9 +5,10 @@ factory's own performance data (productions, factory_jobs, qc_rejects) and emits
 **versioned proposals** for prompt/policy/tone/threshold changes.
 
 Design principles:
-- READ-ONLY. This module NEVER modifies the visual register, tones, thresholds,
-  or code. It only *proposes*; a human (or a reviewer endpoint) decides whether
-  to apply a proposal. This keeps the meta layer safe to run on a schedule.
+- READ-ONLY on its own. This module NEVER auto-modifies the visual register,
+  tones, thresholds, or code. It only *proposes*; a human reviews/approves via
+  the review queue, and an explicit, human-triggered apply writes a change to a
+  persisted config store (never to the register or source directly).
 - Evidence-driven. Every proposal carries the metric data that supports it so a
   human can verify before applying.
 - Threshold-based. Pattern detection fires only when metrics cross configured
@@ -106,7 +107,9 @@ def analyze(conn, days: int = 7, thresholds: Optional[dict] = None,
     """
     from lib.factory_metrics import compute_metrics, compute_dialogue_diversity
 
-    th = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    # Merge persisted (human-applied) threshold overrides under request overrides,
+    # so a human-approved threshold_change takes effect on subsequent analyze() runs.
+    th = {**DEFAULT_THRESHOLDS, **load_threshold_overrides(), **(thresholds or {})}
 
     metrics = compute_metrics(conn, days=days)
     diversity = compute_dialogue_diversity(conn, days=days, limit=limit_dialogue)
@@ -254,3 +257,236 @@ def log_proposals(proposals: List[dict], summary: str) -> None:
             current=p["current_value"], proposed=p["proposed_value"],
             confidence=p["confidence"], risk=p["risk"],
         )
+
+
+def _proposal_signature(p: dict) -> str:
+    """A stable signature for a proposal (type+target+proposed) for dedupe."""
+    return "|".join([str(p.get("type", "")), str(p.get("target", "")),
+                     str(p.get("proposed_value", ""))])
+
+
+def store_proposals(conn, proposals: List[dict]) -> List[str]:
+    """Persist proposals into the optimizer_proposals review queue.
+
+    Returns the ids stored. Dedupes by (type, target, proposed_value): if a row
+    with the same signature already exists in a non-applied state, it is not
+    re-queued (avoids spamming the queue every optimize run).
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone as _tz
+    stored: List[str] = []
+    if not proposals:
+        return stored
+    # Load existing signatures still in play (pending/approved, not applied).
+    existing = set()
+    try:
+        rows = conn.execute(
+            "SELECT type, target, proposed_value FROM optimizer_proposals "
+            "WHERE status IN ('pending','approved')"
+        ).fetchall()
+        existing = {f"{r['type']}|{r['target']}|{r['proposed_value']}" for r in rows}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[meta-optimizer] store_proposals dedupe query failed: {exc}", flush=True)
+    now = datetime.now(_tz.utc).isoformat()
+    for p in proposals:
+        sig = _proposal_signature(p)
+        if sig in existing:
+            continue  # already queued, don't duplicate
+        existing.add(sig)
+        pid = _uuid.uuid4().hex[:16]
+        try:
+            conn.execute(
+                """INSERT INTO optimizer_proposals
+                   (id, type, target, current_value, proposed_value, evidence,
+                    confidence, risk, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (pid,
+                 str(p.get("type", "")), str(p.get("target", "")),
+                 str(p.get("current_value", "")), str(p.get("proposed_value", "")),
+                 str(p.get("evidence", ""))[:1000],
+                 float(p.get("confidence") or 0.0), str(p.get("risk", "medium")),
+                 now),
+            )
+            stored.append(pid)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[meta-optimizer] store_proposal failed: {exc}", flush=True)
+    if stored:
+        try:
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[meta-optimizer] store_proposals commit failed: {exc}", flush=True)
+    return stored
+
+
+def list_proposals(conn, status: Optional[str] = None) -> List[dict]:
+    """Return proposals from the review queue, newest first; optional status filter."""
+    sql = ("SELECT id, type, target, current_value, proposed_value, evidence, "
+           "confidence, risk, status, created_at, reviewed_at, reviewer_notes "
+           "FROM optimizer_proposals")
+    params: tuple = ()
+    if status:
+        sql += " WHERE status = ?"
+        params = (status,)
+    sql += " ORDER BY confidence DESC, created_at DESC"
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[meta-optimizer] list_proposals failed: {exc}", flush=True)
+        return []
+
+
+def set_proposal_status(conn, proposal_id: str, status: str,
+                        notes: Optional[str] = None) -> dict:
+    """Update a proposal's review status. Returns the updated row or {} if not found."""
+    from datetime import datetime, timezone as _tz
+    now = datetime.now(_tz.utc).isoformat()
+    cur: dict = {}
+    try:
+        row = conn.execute(
+            "SELECT * FROM optimizer_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+        if not row:
+            return {}
+        cur = dict(row)
+        if status == "pending":
+            conn.execute(
+                "UPDATE optimizer_proposals SET status=?, reviewer_notes=? WHERE id=?",
+                (status, notes, proposal_id))
+        else:
+            conn.execute(
+                "UPDATE optimizer_proposals SET status=?, reviewed_at=?, reviewer_notes=? "
+                "WHERE id=?",
+                (status, now, notes, proposal_id))
+        conn.commit()
+        updated = dict(conn.execute(
+            "SELECT * FROM optimizer_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone())
+        return updated
+    except Exception as exc:  # noqa: BLE001
+        print(f"[meta-optimizer] set_proposal_status failed: {exc}", flush=True)
+        return cur if 'cur' in locals() else {}
+
+
+# ─── Apply approved proposals (human-gated) ───────────────────────────────────
+
+_APPLIED_FILE = "optimizer_applied.json"
+_THRESHOLDS_FILE = "optimizer_thresholds.json"
+
+
+def _config_dir() -> Any:
+    from pathlib import Path
+    d = Path(__file__).resolve().parent.parent / "data"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_json(name: str, default: Any) -> Any:
+    import json
+    from pathlib import Path
+    p = _config_dir() / name
+    try:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[meta-optimizer] load {name} failed: {exc}", flush=True)
+    return default
+
+
+def _save_json(name: str, data: Any) -> None:
+    import json
+    p = _config_dir() / name
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+    _log_info("optimize.config_written", file=name)
+
+
+def load_threshold_overrides() -> dict:
+    """Persisted threshold overrides applied through the review queue."""
+    return _load_json(_THRESHOLDS_FILE, {})
+
+
+def _save_threshold_overrides(overrides: dict) -> None:
+    _save_json(_THRESHOLDS_FILE, overrides)
+
+
+def _load_applied_log() -> list:
+    return _load_json(_APPLIED_FILE, [])
+
+
+def _record_applied(record: dict) -> None:
+    log_ = _load_applied_log()
+    log_.append(record)
+    _save_json(_APPLIED_FILE, log_)
+
+
+def apply_proposal(conn, proposal_id: str) -> dict:
+    """Apply an APPROVED proposal.
+
+    Writes the change to the persisted config store (threshold overrides or the
+    applied-changes audit log), flips the proposal to status='applied', and logs
+    exactly what was applied so a human can audit/roll back.
+
+    Only operates on status='approved' proposals (human approved it first).
+    """
+    from datetime import datetime, timezone as _tz
+    row = conn.execute(
+        "SELECT * FROM optimizer_proposals WHERE id = ?", (proposal_id,)
+    ).fetchone()
+    if not row:
+        raise LookupError(f"proposal {proposal_id} not found")
+    prop = dict(row)
+    if prop.get("status") != "approved":
+        raise ValueError(
+            f"proposal {proposal_id} has status '{prop.get('status')}'; "
+            "only 'approved' proposals can be applied")
+
+    now = datetime.now(_tz.utc).isoformat()
+    what = {
+        "proposal_id": proposal_id,
+        "type": prop.get("type"),
+        "target": prop.get("target"),
+        "current_value": prop.get("current_value"),
+        "proposed_value": prop.get("proposed_value"),
+        "applied_at": now,
+    }
+
+    ptype = prop.get("type")
+    target = prop.get("target", "")
+
+    if ptype == "threshold_change":
+        # Persist a threshold override so future analyze() runs use it as the base.
+        overrides = load_threshold_overrides()
+        key = target or "threshold"
+        v = prop.get("proposed_value")
+        if v is None:
+            v = ""
+        try:
+            overrides[key] = float(v)
+        except (TypeError, ValueError):
+            overrides[key] = str(v)
+        _save_threshold_overrides(overrides)
+        what["store"] = _THRESHOLDS_FILE
+        _log_info("optimize.applied", type="threshold_change", target=target,
+                  value=prop.get("proposed_value"))
+
+    else:
+        # tone_adjustment / prompt_patch / style_retirement: record the intended
+        # change in the applied-config audit log (code/register edits are manual
+        # and out of scope for the read-only meta layer).
+        _record_applied(what)
+        what["store"] = _APPLIED_FILE
+        _log_info("optimize.applied", type=ptype, target=target,
+                  value=prop.get("proposed_value"))
+
+    conn.execute(
+        "UPDATE optimizer_proposals SET status='applied', reviewed_at=?, "
+        "reviewer_notes=COALESCE(reviewer_notes, 'applied') WHERE id=?",
+        (now, proposal_id))
+    conn.commit()
+    updated = dict(conn.execute(
+        "SELECT * FROM optimizer_proposals WHERE id = ?", (proposal_id,)
+    ).fetchone())
+    what["status"] = "applied"
+    return {"applied": what, "proposal": updated}

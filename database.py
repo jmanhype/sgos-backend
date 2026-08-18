@@ -224,6 +224,27 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_qcr_reviewed ON qc_rejects(reviewed_at DESC);
     """)
 
+    # Meta-optimizer human-review queue — proposals the optimizer emits for a human
+    # to review/approve/reject before any change is applied.
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS optimizer_proposals (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,          -- prompt_patch|tone_adjustment|threshold_change|style_retirement
+            target TEXT NOT NULL,
+            current_value TEXT,
+            proposed_value TEXT,
+            evidence TEXT,
+            confidence REAL,
+            risk TEXT,
+            status TEXT DEFAULT 'pending',  -- pending|approved|rejected|applied
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewed_at TIMESTAMP,
+            reviewer_notes TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_op_status ON optimizer_proposals(status);
+        CREATE INDEX IF NOT EXISTS idx_op_type ON optimizer_proposals(type);
+    """)
+
     # Create FTS5 virtual table if not exists
     try:
         c.execute("""
