@@ -721,11 +721,12 @@ async def _collect_reroll_improvements(video_paths: list) -> list:
 def _apply_reroll_to_flux3(brief: dict, improvements: list) -> dict:
     """Post-process the flux3 /t2v prompt for a reroll so it ACTUALLY changes.
 
-    VBL may return a cached/prompt with stale quoted dialogue ("Y'all see what
-    just happened?") even when a new premise/goal is sent. We can't change VBL
-    from sgos-backend, so:
-      1. Strip quoted dialogue + voice/speaker directions from the flux3 prompt.
-      2. Append the prompt_improvements as visual description additions.
+    Flux 3 CAN and SHOULD do dialogue/lip-sync — so we NEVER strip existing
+    dialogue. The real improvement comes from a more specific premise, which
+    makes VBL generate matching dialogue naturally next time. We only touch the
+    visual description parts:
+      1. KEEP all existing dialogue as-is.
+      2. Append the prompt_improvements as visual/context additions.
     Returns a NEW brief (does not mutate the caller's dict) whose flux3 prompt
     is guaranteed to differ from the original.
     """
@@ -735,38 +736,25 @@ def _apply_reroll_to_flux3(brief: dict, improvements: list) -> dict:
         return brief
     orig = flux3
 
-    # Strip quoted dialogue (single or double quotes) and voice/speaker phrasing.
-    cleaned = re.sub(r'"[^"]*"|\'[^\']*\'', "", flux3)
-    cleaned = re.sub(
-        r"\b(says|saying|said|speaks|speech|say|voice(?:-?over)?|dialogue|off(?:-)?screen|v\.o\.)\b[^,.;]*",
-        "", cleaned, flags=re.IGNORECASE,
-    )
-    # Collapse leftover artifacts: stray commas (', ,'), empty segments.
-    cleaned = re.sub(r"\s*,+\s*,+\s*", ", ", cleaned)
-    cleaned = re.sub(r"\s*,\s*$", "", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-    cleaned = cleaned.rstrip(", ").strip()
-    if cleaned:
-        flux3 = cleaned
-
-    # Append improvements as visual additions (before the /t2v params).
+    flux3_out = flux3
+    # Append improvements as visual/context addition (before the /t2v params).
+    # Dialogue-related improvements are kept as context so VBL writes better
+    # matching dialogue; visual improvements sharpen the scene.
     additions = ", ".join(i.rstrip(".") for i in improvements if str(i).strip())
     if additions:
-        if " duration:" in flux3:
-            head, _, tail = flux3.partition(" duration:")
-            flux3 = f"{head.rstrip(',')}, {additions}. duration:{tail}"
+        if " duration:" in flux3_out:
+            head, _, tail = flux3_out.partition(" duration:")
+            flux3_out = f"{head.rstrip(',')}, {additions}. duration:{tail}"
         else:
-            flux3 = f"{flux3.rstrip()}. {additions}."
+            flux3_out = f"{flux3_out.rstrip()}. {additions}."
 
-    if flux3 == orig:
-        # Dialogue-strip didn't change anything; force a distinguishing suffix.
-        flux3 = f"{flux3.rstrip()}. Enhanced reroll: {', '.join(improvements)}."
+    if flux3_out == orig:
+        flux3_out = f"{flux3_out.rstrip()}. Enhanced reroll: {', '.join(improvements)}."
 
-    n_dialogue = len(re.findall(r'"[^"]*"|\'[^\']*\'', orig))
-    print(f"[REROLL_FIX] Cleaned flux3 prompt for reroll: removed {n_dialogue} dialogue strings; now differs from original", flush=True)
+    print("[REROLL_FIX] Kept all dialogue; appended improvements as visual/context additions; flux3 now differs from original", flush=True)
 
     new_pp = dict(pp)
-    new_pp["flux3"] = flux3
+    new_pp["flux3"] = flux3_out
     new_brief = dict(brief)
     new_brief["production_prompts"] = new_pp
     return new_brief
