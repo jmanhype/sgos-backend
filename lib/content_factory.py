@@ -632,6 +632,16 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
         production_id = await asyncio.to_thread(register_production, reg_meta)
         print(f"[STORE] Registered production {production_id}", flush=True)
         logger.info(f"_finalize_media: registered {production_id} size={file_size} hash={file_hash[:12]}")
+
+        # Run QC review (non-blocking for the pipeline; failures don't affect file delivery)
+        try:
+            vid_meta = _extract_video_meta(dest)
+            qc_result = await _qc_review_video(dest, vid_meta, production_id)
+            print(f"[QC] Final score for {production_id}: {qc_result['score']}/10", flush=True)
+        except Exception as qc_exc:
+            print(f"[QC] QC review failed (non-fatal): {qc_exc}", flush=True)
+            logger.warning(f"_finalize_media: QC review failed: {qc_exc}")
+
         return str(dest)
     except Exception as exc:
         print(f"[STORE] Registration FAILED: {exc}", flush=True)
@@ -673,6 +683,135 @@ def _extract_video_meta(path: Path) -> dict:
         return {"resolution": resolution, "duration_s": duration}
     except Exception:
         return {}
+
+
+def _extract_qc_frames(video_path: Path, frames_dir: Path) -> list[Path]:
+    """Extract 3 frames at 25%, 50%, 75% of video duration using ffmpeg.
+
+    Returns list of frame paths. Empty list on any failure.
+    """
+    import subprocess as _sp
+    meta = _extract_video_meta(video_path)
+    duration = meta.get("duration_s")
+    if not duration or duration <= 0:
+        print(f"[QC] Cannot extract frames: duration={duration}", flush=True)
+        return []
+
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    timestamps = [duration * 0.25, duration * 0.50, duration * 0.75]
+    frame_paths = []
+
+    for i, ts in enumerate(timestamps):
+        out = frames_dir / f"frame_{i}_{ts:.1f}s.jpg"
+        try:
+            r = _sp.run(
+                ["ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(video_path),
+                 "-frames:v", "1", "-q:v", "2", str(out)],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                frame_paths.append(out)
+            else:
+                print(f"[QC] Frame extraction failed at {ts:.1f}s: {r.stderr[:100]}", flush=True)
+        except Exception as e:
+            print(f"[QC] Frame extraction error at {ts:.1f}s: {e}", flush=True)
+
+    print(f"[QC] Extracted {len(frame_paths)}/3 frames from {video_path.name}", flush=True)
+    return frame_paths
+
+
+def _qc_local_check(video_path: Path, vid_meta: dict) -> dict:
+    """Local QC checks that don't need an external API.
+
+    Checks: file size > 1MB, duration > 3s, valid resolution.
+    Returns {score: float, notes: str}.
+    """
+    checks = []
+    score = 10.0
+
+    # File size check
+    try:
+        size = video_path.stat().st_size
+        if size < 1_000_000:
+            checks.append(f"FAIL: file size {size} bytes < 1MB (possibly corrupt)")
+            score -= 5.0
+        else:
+            checks.append(f"OK: file size {size:,} bytes")
+    except OSError as e:
+        checks.append(f"FAIL: cannot stat file: {e}")
+        score -= 5.0
+
+    # Duration check
+    duration = vid_meta.get("duration_s")
+    if duration is None or duration <= 3.0:
+        checks.append(f"FAIL: duration {duration}s <= 3s (possibly empty/truncated)")
+        score -= 3.0
+    else:
+        checks.append(f"OK: duration {duration}s")
+
+    # Resolution check
+    resolution = vid_meta.get("resolution")
+    if not resolution:
+        checks.append("FAIL: no resolution detected")
+        score -= 2.0
+    else:
+        try:
+            w, h = resolution.split("x")
+            wi, hi = int(w), int(h)
+            if wi < 100 or hi < 100:
+                checks.append(f"FAIL: resolution {resolution} too small")
+                score -= 2.0
+            else:
+                checks.append(f"OK: resolution {resolution}")
+        except (ValueError, AttributeError):
+            checks.append(f"WARN: unparseable resolution '{resolution}'")
+            score -= 1.0
+
+    score = max(0.0, score)
+    notes = "; ".join(checks)
+    return {"score": score, "notes": notes}
+
+
+async def _qc_review_video(
+    video_path: Path,
+    vid_meta: dict,
+    production_id: str,
+) -> dict:
+    """Run QC review on a production video.
+
+    Currently uses local checks only. External vision API can be added later.
+    Updates the production record with qc_score and qc_notes.
+    Returns {score, notes}.
+    """
+    print(f"[QC] Starting QC review for {production_id}: {video_path.name}", flush=True)
+
+    # Local checks (always run)
+    result = _qc_local_check(video_path, vid_meta)
+    score = result["score"]
+    notes = result["notes"]
+
+    # Extract frames for future vision QC (also validates video is readable)
+    frames_dir = video_path.parent / f".qc_{video_path.stem}"
+    frames = await asyncio.to_thread(_extract_qc_frames, video_path, frames_dir)
+    if frames:
+        notes += f"; {len(frames)} QC frames extracted"
+
+    # Update DB with QC results
+    try:
+        from database import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE productions SET qc_score = ?, qc_notes = ? WHERE id = ?",
+            (score, notes, production_id),
+        )
+        conn.commit()
+        print(f"[QC] Updated {production_id}: score={score}, notes={notes}", flush=True)
+    except Exception as e:
+        print(f"[QC] Failed to update DB for {production_id}: {e}", flush=True)
+        logger.error(f"_qc_review_video: DB update failed: {e}")
+
+    logger.info(f"_qc_review_video: {production_id} score={score}")
+    return {"score": score, "notes": notes}
 
 
 async def run_production_cycle(config: dict) -> dict:

@@ -152,6 +152,16 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_prod_engine_hash ON productions(engine, file_hash) WHERE file_hash IS NOT NULL;
     """)
 
+    # Migrate: add QC columns if missing (safe for existing tables)
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(productions)").fetchall()}
+        if "qc_score" not in cols:
+            c.execute("ALTER TABLE productions ADD COLUMN qc_score REAL")
+        if "qc_notes" not in cols:
+            c.execute("ALTER TABLE productions ADD COLUMN qc_notes TEXT")
+    except Exception:
+        pass  # Table may not exist yet; columns will be created with next init
+
     # Create FTS5 virtual table if not exists
     try:
         c.execute("""
