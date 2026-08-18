@@ -419,38 +419,48 @@ async def _collect_cdn_urls() -> set[str]:
 
 
 def _reply_cdn_js(message_id: Optional[str] = None) -> str:
-    """JS to collect CDN mp4 URLs from reply messages to a specific message_id.
+    """JS to collect CDN mp4 URLs from Discord.
 
-    If message_id is provided, only scans messages that are replies to it.
-    Falls back to scanning all video URLs if message_id is None.
+    Primary (message_id set): look for result_A.mp4 / result_B.mp4 patterns
+    in messages after our message_id, plus any reply-chain matches.
+    Fallback (message_id None): scan all video URLs on page.
     """
     if message_id:
-        # Discord uses id="chat-messages-{channel}-{msg_id}" format
-        # Reply messages contain a reference to the parent message
+        # Strategy: find ALL mp4 URLs on page, but prioritize those in messages
+        # that reference our message_id OR contain result_A/result_B filenames.
         return (
             f"(()=>{{"
             f"const targetId='{message_id}';"
-            f"const urls=new Set();"
-            # Find all message elements with numeric IDs
+            f"const allUrls=new Set();"
+            f"const targetedUrls=new Set();"
+            # Collect ALL video URLs on the page
+            f"document.querySelectorAll('video source, video[src]').forEach(v=>{{"
+            f"  const s=(v.currentSrc||v.src||'');"
+            f"  if(s.includes('cdn.discordapp.com')&&s.includes('.mp4'))allUrls.add(s);"
+            f"}});"
+            # Find messages referencing our message_id or containing result_ pattern
             f"const allEls=[...document.querySelectorAll('li[id],div[id]')];"
-            f"const msgEls=allEls.filter(e=>e.id.match(/\\d{{17,20}}$/));"
-            # Filter to replies: elements whose text or child refs mention our message_id
-            f"const replies=msgEls.filter(m=>{{"
+            f"const msgEls=allEls.filter(e=>/\\d{{17,20}}$/.test(e.id));"
+            f"msgEls.forEach(m=>{{"
             f"  const text=m.textContent||'';"
-            f"  const refLink=m.querySelector('a[href*=\"'+targetId+'\"]');"
-            f"  return refLink||text.includes(targetId);"
+            f"  const hasRef=text.includes(targetId);"
+            f"  const hasResult=/result_[AB]\\.mp4/.test(text)||/attachments\\/\\d+\\/\\d+\\//.test(text);"
+            f"  if(hasRef||hasResult){{"
+            f"    m.querySelectorAll('video source, video[src]').forEach(v=>{{"
+            f"      const s=v.currentSrc||v.src||'';"
+            f"      if(s.includes('cdn.discordapp.com')&&s.includes('.mp4'))targetedUrls.add(s);"
+            f"    }});"
+            f"  }}"
             f"}});"
-            f"replies.forEach(msg=>{{"
-            f"  msg.querySelectorAll('video source, video[src]').forEach(v=>{{"
-            f"    const s=v.src||v.currentSrc||'';"
-            f"    if(s.includes('cdn.discordapp.com')&&s.includes('.mp4'))urls.add(s);"
-            f"  }});"
+            f"return JSON.stringify({{"
+            f"  all:[...allUrls],"
+            f"  targeted:[...targetedUrls],"
+            f"  msgCount:msgEls.length,"
+            f"  matchCount:targetedUrls.size"
             f"}});"
-            f"return JSON.stringify({{urls:[...urls],replyCount:replies.length}});"
             f"}})()"
         )
     else:
-        # Fallback: scan all video URLs (original behavior)
         return _cdn_js()
 
 
@@ -458,9 +468,10 @@ async def _poll_flux3(
     seen_urls: Optional[set] = None,
     message_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Poll Discord for result.mp4 CDN url from Flux3 bot reply.
+    """Poll Discord for result.mp4 CDN url from Flux3 bot.
 
-    Primary mode (message_id set): looks for bot replies to our specific message.
+    Primary mode (message_id set): looks for result_A/result_B mp4 files in
+    messages referencing our message_id, plus tracks new URLs vs baseline.
     Fallback mode (message_id None): scans all new video URLs vs baseline.
 
     Polls every FLUX_POLL_INTERVAL (15s) for up to ~5 minutes.
@@ -468,6 +479,7 @@ async def _poll_flux3(
     """
     seen = set(seen_urls or set())
     mode = "targeted" if message_id else "baseline"
+    print(f"[FLUX3] _poll_flux3: {mode} mode, message_id={message_id}, baseline_seen={len(seen)}", flush=True)
     logger.info(
         f"_poll_flux3: {mode} mode, polling every {FLUX_POLL_INTERVAL}s, "
         f"up to {FLUX_POLL_ATTEMPTS} attempts"
@@ -479,47 +491,70 @@ async def _poll_flux3(
                 js = _reply_cdn_js(message_id)
                 r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": js})
                 raw = (r.json().get("result") or "").strip()
+                print(f"[FLUX3] attempt {attempt}: raw response length={len(raw)}", flush=True)
 
-                if message_id:
+                if message_id and raw.startswith("{"):
                     # Targeted mode: parse structured response
                     try:
-                        data = json.loads(raw) if raw.startswith("{") else {"urls": [], "replyCount": 0}
-                        urls = data.get("urls", [])
-                        reply_count = data.get("replyCount", 0)
+                        data = json.loads(raw)
+                        all_urls = data.get("all", [])
+                        targeted = data.get("targeted", [])
+                        msg_count = data.get("msgCount", 0)
+                        match_count = data.get("matchCount", 0)
+                        print(
+                            f"[FLUX3] attempt {attempt}: msgs={msg_count}, "
+                            f"targeted_matches={match_count}, all_videos={len(all_urls)}, "
+                            f"targeted_urls={len(targeted)}",
+                            flush=True,
+                        )
                         logger.info(
                             f"_poll_flux3: attempt {attempt}/{FLUX_POLL_ATTEMPTS} "
-                            f"found {reply_count} replies, {len(urls)} cdn urls"
+                            f"msgs={msg_count} targeted={match_count} all={len(all_urls)}"
                         )
-                        if urls:
-                            full = urls[-1]
-                            logger.info(f"_poll_flux3: targeted result from reply: {full}")
+                        # Priority 1: targeted URLs (from reply/result_ messages)
+                        new_targeted = [u for u in targeted if u not in seen]
+                        if new_targeted:
+                            full = new_targeted[-1]
+                            print(f"[FLUX3] TARGETED RESULT: {full}", flush=True)
+                            logger.info(f"_poll_flux3: targeted result: {full}")
                             return full
-                    except json.JSONDecodeError:
+                        # Priority 2: any new URL not in baseline (catches result_A/B even without reply match)
+                        new_all = [u for u in all_urls if u not in seen]
+                        if new_all:
+                            full = new_all[-1]
+                            print(f"[FLUX3] NEW URL (not in baseline): {full}", flush=True)
+                            logger.info(f"_poll_flux3: new URL vs baseline: {full}")
+                            return full
+                    except json.JSONDecodeError as e:
+                        print(f"[FLUX3] JSON parse error: {e}, raw[:200]={raw[:200]}", flush=True)
                         logger.warning(f"_poll_flux3: could not parse targeted response: {raw[:100]}")
                 else:
                     # Baseline fallback mode
                     urls = json.loads(raw) if raw.startswith("[") else []
                     new = [u for u in urls if u not in seen]
+                    print(f"[FLUX3] baseline attempt {attempt}: total={len(urls)}, new={len(new)}", flush=True)
                     logger.info(
                         f"_poll_flux3: attempt {attempt}/{FLUX_POLL_ATTEMPTS} "
                         f"found {len(urls)} cdn urls, {len(new)} new"
                     )
                     if new:
                         full = new[-1]
+                        print(f"[FLUX3] BASELINE RESULT: {full}", flush=True)
                         logger.info(f"_poll_flux3: baseline result: {full}")
                         return full
             except Exception as exc:
+                print(f"[FLUX3] attempt {attempt} error: {exc}", flush=True)
                 logger.warning(f"_poll_flux3: attempt {attempt} error: {exc}")
             await asyncio.sleep(FLUX_POLL_INTERVAL)
 
-    # If targeted mode failed, try one round of baseline as last resort
+    # If targeted mode failed, try one final baseline sweep
     if message_id:
+        print("[FLUX3] targeted mode exhausted, trying final baseline sweep", flush=True)
         logger.warning("_poll_flux3: targeted mode found nothing, trying baseline fallback")
         try:
             baseline_seen = await _collect_cdn_urls()
         except Exception:
             baseline_seen = set()
-        # Quick single-pass baseline check
         await asyncio.sleep(FLUX_POLL_INTERVAL)
         try:
             r = await client.post(f"{EGO_BRIDGE_URL}/v1/evaluate", json={"js": _cdn_js()})
@@ -527,11 +562,13 @@ async def _poll_flux3(
             urls = json.loads(raw) if raw.startswith("[") else []
             new = [u for u in urls if u not in baseline_seen]
             if new:
+                print(f"[FLUX3] FINAL BASELINE FALLBACK: {new[-1]}", flush=True)
                 logger.info(f"_poll_flux3: baseline fallback found result: {new[-1]}")
                 return new[-1]
         except Exception:
             pass
 
+    print(f"[FLUX3] NO RESULT after {FLUX_POLL_ATTEMPTS} attempts ({mode} mode)", flush=True)
     logger.error(f"_poll_flux3: no result after {FLUX_POLL_ATTEMPTS} attempts ({mode} mode)")
     return None
 
@@ -566,6 +603,7 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
 
     Returns the final path string on success, or None on any failure (logged).
     `meta` must carry engine/kind and identity fields used for registration.
+    Uses print() alongside logger for daemon-thread visibility.
     """
     try:
         file_size = dest.stat().st_size
@@ -578,10 +616,25 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
         })
         # Sidecar written before registration; register is the durable commit.
         await asyncio.to_thread(write_meta_sidecar, dest, reg_meta)
+        print(f"[STORE] Registering production: engine={reg_meta.get('engine')}, hash={file_hash[:12]}, size={file_size}", flush=True)
+
+        # Ensure productions table exists in current DB (may be first run in container)
+        from database import get_connection
+        conn = get_connection()
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='productions'"
+        ).fetchall()
+        if not tables:
+            print("[STORE] productions table missing — running init_db()", flush=True)
+            from database import init_db
+            init_db()
+
         production_id = await asyncio.to_thread(register_production, reg_meta)
+        print(f"[STORE] Registered production {production_id}", flush=True)
         logger.info(f"_finalize_media: registered {production_id} size={file_size} hash={file_hash[:12]}")
         return str(dest)
     except Exception as exc:
+        print(f"[STORE] Registration FAILED: {exc}", flush=True)
         logger.error(f"_finalize_media: store write failed: {exc}")
         return None
 
@@ -627,10 +680,12 @@ async def run_production_cycle(config: dict) -> dict:
 
     config keys: style_id/franchise/premise/niche overrides; output_dir.
     """
+    print(f"[FACTORY] run_production_cycle starting with config keys: {list(config.keys())}", flush=True)
     pick = (
         await asyncio.to_thread(pick_next_production) if not config.get("style_id")
         else config
     )
+    print(f"[FACTORY] pick complete: style={pick.get('style_id')}, franchise={pick.get('franchise')}", flush=True)
 
     brief_resp = await _get_brief(pick)
     brief = brief_resp.get("brief") or {}
@@ -708,12 +763,15 @@ async def _submit_and_poll_h3(brief: dict, out_dir: Path, provenance: Optional[d
     with the production store (engine='h3') using `provenance` metadata.
     """
     provenance = provenance or {}
+    print(f"[H3] _submit_and_poll_h3: starting H3 pipeline", flush=True)
+    logger.info("_submit_and_poll_h3: starting H3 pipeline")
     inner = brief.get("brief", brief)
     pp = inner.get("production_prompts", {})
     raw_job = pp.get("h3_multishot_json") or pp.get("h3_job_json")
     if not raw_job:
         logger.error("_submit_and_poll_h3: no h3_multishot_json or h3_job_json in brief")
         return None
+    logger.info(f"_submit_and_poll_h3: got job config with keys: {list(raw_job.keys()) if isinstance(raw_job, dict) else type(raw_job)}")
 
     # Build the complete WGP config (Ref2VA fallback, motion injection, etc.).
     try:
