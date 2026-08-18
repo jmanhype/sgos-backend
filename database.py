@@ -140,6 +140,7 @@ def init_db():
             file_hash TEXT,
             prompt TEXT,
             render_duration_s REAL,
+            config_hash TEXT,
             generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(engine, file_hash)
         );
@@ -186,6 +187,8 @@ def init_db():
             c.execute("ALTER TABLE productions ADD COLUMN qc_score REAL")
         if "qc_notes" not in cols:
             c.execute("ALTER TABLE productions ADD COLUMN qc_notes TEXT")
+        if "config_hash" not in cols:
+            c.execute("ALTER TABLE productions ADD COLUMN config_hash TEXT")
     except Exception:
         pass  # Table may not exist yet; columns will be created with next init
 

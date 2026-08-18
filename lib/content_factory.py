@@ -12,6 +12,7 @@ production to data/production_log.json.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -116,62 +117,110 @@ def _get_style_guide(style_id: str) -> Optional[dict]:
     return None
 
 
+# ─── Tone-hint fallback for unknown styles ─────────────────────────────────────
+
+_TONE_HINTS = {
+    # Keywords → (tone description, banned phrases)
+    "kaiju": ("ominous narrator, military tech-speak, awe-struck witness", ["Y'all", "no cap", "fr fr", "bruh"]),
+    "godzilla": ("ominous narrator, military tech-speak, awe-struck witness", ["Y'all", "no cap", "fr fr", "bruh"]),
+    "robot": ("pilot tech-speak, mechanical precision, mission briefing", ["Y'all", "no cap", "fr fr", "bruh"]),
+    "mech": ("pilot tech-speak, mechanical precision, mission briefing", ["Y'all", "no cap", "fr fr", "bruh"]),
+    "space": ("retro-futuristic narration, scientific wonder, mission log tone", ["Y'all", "no cap", "fr fr", "bruh"]),
+    "cosmonaut": ("retro-futuristic narration, scientific wonder, mission log tone", ["Y'all", "no cap", "fr fr", "bruh"]),
+    "sitcom": ("warm ensemble banter, comedic timing, audience-aware delivery", ["no cap", "fr fr"]),
+    "comedy": ("warm ensemble banter, comedic timing, audience-aware delivery", ["no cap", "fr fr"]),
+    "laugh": ("warm ensemble banter, comedic timing, audience-aware delivery", ["no cap", "fr fr"]),
+    "horror": ("tense whisper, dread-filled narration, fragmented speech", ["Y'all", "no cap", "fr fr", "bruh", "lol"]),
+    "slasher": ("tense whisper, dread-filled narration, fragmented speech", ["Y'all", "no cap", "fr fr", "bruh", "lol"]),
+    "cursed": ("tense whisper, dread-filled narration, fragmented speech", ["Y'all", "no cap", "fr fr", "bruh", "lol"]),
+    "office": ("corporate jargon, passive-aggressive politeness, meeting-speak", ["no cap", "fr fr", "bruh"]),
+    "corporate": ("corporate jargon, passive-aggressive politeness, meeting-speak", ["no cap", "fr fr", "bruh"]),
+    "school": ("earnest student voice, classroom formality, youthful enthusiasm", ["no cap", "fr fr"]),
+    "classroom": ("earnest student voice, classroom formality, youthful enthusiasm", ["no cap", "fr fr"]),
+    "fitness": ("motivational coach energy, rep counting, encouragement", ["no cap", "fr fr"]),
+    "cooking": ("chef narration, ingredient focus, instructional warmth", ["no cap", "fr fr"]),
+    "kitchen": ("chef narration, ingredient focus, instructional warmth", ["no cap", "fr fr"]),
+    "racing": ("commentator excitement, speed narration, technical precision", ["no cap", "fr fr"]),
+    "warhammer": ("grimdark narration, battle chronicle, fatalistic determination", ["Y'all", "no cap", "fr fr", "bruh"]),
+    "pokemon": ("adventure narrator, creature encyclopedia tone, youthful wonder", ["no cap", "fr fr"]),
+    "puppet": ("uncanny narrator, children's show cadence with dark undertone", ["no cap", "fr fr", "bruh"]),
+    "vhs": ("period-appropriate speech, analog warmth, nostalgic narration", ["no cap", "fr fr", "bruh"]),
+    "punk": ("rebellious edge, anti-establishment tone, raw energy", ["sir", "ma'am"]),
+    "noir": ("hardboiled narration, cynical inner monologue, terse dialogue", ["Y'all", "no cap", "fr fr", "bruh", "lol"]),
+    "anime": ("stylized speech, dramatic declarations, emotional intensity", ["no cap", "fr fr"]),
+    "fantasy": ("archaic/formal speech, quest narration, mythic tone", ["no cap", "fr fr", "bruh"]),
+}
+
+
+def _infer_tone_from_ids(style_id: str, franchise: str = "") -> Optional[dict]:
+    """Infer a dialogue_guide from style_id/franchise name keywords.
+
+    Used as fallback when _get_style_guide() returns None.
+    Returns a dialogue_guide dict or None if no hints match.
+    """
+    combined = f"{style_id} {franchise}".lower().replace("-", " ").replace("_", " ")
+    for keyword, (tone, banned) in _TONE_HINTS.items():
+        if keyword in combined:
+            return {"tone": tone, "banned_phrases": banned, "examples": []}
+    return None
+
+
 def _load_franchises() -> list[str]:
-    """Franchise/aesthetic names from the lost-futures index.
+    """Franchise/aesthetic names from the SGFLIX Lost Futures index.
 
-    Each top-level dir is treated as a franchise group, and any markdown file
-    inside contributes its stem. Leading `YYYY-MM-DD_` date prefixes are
-    stripped so generated premises read naturally.
+    Uses the built-in canonical franchise list as the PRIMARY source.
+    These are actual content franchises with defined characters, settings,
+    and tone — NOT research document titles from gist-archive directories.
 
-    Falls back to a built-in list from the SGFLIX Lost Futures index when
-    the external gist-archive directory isn't available (e.g. inside Docker).
+    The gist-archive directory is used ONLY as supplementary source for
+    additional franchise names that aren't in the canonical list.
     """
     import re as _re
-    if not LOST_FUTURES_INDEX.is_dir():
-        # Built-in fallback: top franchises from sgflix-lost-futures-index
-        return [
-            "magnitude-kaiju", "proximity-kaiju", "kart-hell-95",
-            "megacorp-office", "jurassic-live-pd", "fnaf-cctv",
-            "arcade-demons", "block-mission", "curriculum-breach",
-            "inner-voltage", "darkknight-sentai", "grove-street-stories",
-            "aisle-13", "bone-kitchen", "cloud-gardener",
-            "cosmonaut-9", "crimson-kabuki", "cul-de-sac-jutsu",
-            "dissolve", "el-coyote", "jade-express",
-            "iron-hands", "daughters-of-the-sun",
-            "mario-kart-twisted-metal", "imperial-hr",
-            "hawkins-911", "daily-bugle", "hbo-muppets",
-            "kitchen-nightmares", "warhammer-40k",
-            "pokemon-underground", "godzilla-iphone-pov",
-            "bodycam-chaos", "ecohorror-puppet", "soviet-space-opera",
-            "mall-slasher", "evidence-room-toy", "occult-school",
-            "fitness-vhs", "ninja-hoa", "aquatic-puppet",
-            "factory-mascot", "fashion-doll-recruitment",
-            "used-car-robot", "wall-crawler-psa", "teen-counseling",
-            "cursed-relic-fantasy", "tuner-racing", "toddler-mascot",
-            "superteam-disaster",
-        ]
-    franchises: list[str] = []
-    def clean(name: str) -> str:
-        return _re.sub(r"^\d{4}-\d{2}-\d{2}_", "", name)
-    def keep(name: str) -> bool:
-        # Skip hidden gist-archive artifacts and empty names.
-        return bool(name.strip()) and not name.startswith(".") and ".gist-meta" not in name
-    for d in sorted(LOST_FUTURES_INDEX.iterdir()):
-        if d.is_dir():
-            c = clean(d.name)
-            if keep(c):
-                franchises.append(c)
-        for f in sorted(d.glob("*.md")):
-            c = clean(f.stem)
-            if keep(c):
-                franchises.append(c)
-    # Dedup, keep order.
-    seen: set[str] = set()
-    out: list[str] = []
-    for name in franchises:
-        if name and name not in seen:
-            seen.add(name)
-            out.append(name)
+
+    # Canonical SGFLIX franchises — always included first
+    canonical = [
+        "magnitude-kaiju", "proximity-kaiju", "kart-hell-95",
+        "megacorp-office", "jurassic-live-pd", "fnaf-cctv",
+        "arcade-demons", "block-mission", "curriculum-breach",
+        "inner-voltage", "darkknight-sentai", "grove-street-stories",
+        "aisle-13", "bone-kitchen", "cloud-gardener",
+        "cosmonaut-9", "crimson-kabuki", "cul-de-sac-jutsu",
+        "dissolve", "el-coyote", "jade-express",
+        "iron-hands", "daughters-of-the-sun",
+        "mario-kart-twisted-metal", "imperial-hr",
+        "hawkins-911", "daily-bugle", "hbo-muppets",
+        "kitchen-nightmares", "warhammer-40k",
+        "pokemon-underground", "godzilla-iphone-pov",
+        "bodycam-chaos", "ecohorror-puppet", "soviet-space-opera",
+        "mall-slasher", "evidence-room-toy", "occult-school",
+        "fitness-vhs", "ninja-hoa", "aquatic-puppet",
+        "factory-mascot", "fashion-doll-recruitment",
+        "used-car-robot", "wall-crawler-psa", "teen-counseling",
+        "cursed-relic-fantasy", "tuner-racing", "toddler-mascot",
+        "superteam-disaster",
+    ]
+
+    seen: set[str] = set(canonical)
+    out: list[str] = list(canonical)
+
+    # Supplementary: add any additional franchises from gist-archive
+    if LOST_FUTURES_INDEX.is_dir():
+        def clean(name: str) -> str:
+            return _re.sub(r"^\d{4}-\d{2}-\d{2}_", "", name)
+        def keep(name: str) -> bool:
+            return bool(name.strip()) and not name.startswith(".") and ".gist-meta" not in name
+        for d in sorted(LOST_FUTURES_INDEX.iterdir()):
+            if d.is_dir():
+                c = clean(d.name)
+                if keep(c) and c not in seen:
+                    seen.add(c)
+                    out.append(c)
+            for f in sorted(d.glob("*.md")):
+                c = clean(f.stem)
+                if keep(c) and c not in seen:
+                    seen.add(c)
+                    out.append(c)
+
     return out
 
 
@@ -675,6 +724,83 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
             print(f"[QC] QC review failed (non-fatal): {qc_exc}", flush=True)
             logger.warning(f"_finalize_media: QC review failed: {qc_exc}")
 
+        # GAP 2: Run VLM curator on newly registered production (non-blocking)
+        try:
+            from database import get_connection as _gc
+            _conn = _gc()
+            already_curated = _conn.execute(
+                "SELECT 1 FROM qc_rejects WHERE production_id = ? LIMIT 1", (production_id,)
+            ).fetchone()
+            if not already_curated:
+                print(f"[CURATOR] Triggering inline curation for {production_id}", flush=True)
+                # Inline curator: re-encode + ModelScope vision analysis
+                import subprocess as _sp
+                import base64 as _b64
+                import urllib.request as _urllib_req
+                api_key = os.environ.get("MODELSCOPE_API_KEY", "")
+                if api_key and dest.exists() and dest.stat().st_size > 1_000_000:
+                    small = dest.parent / f".curator_{dest.stem}.mp4"
+                    _r = _sp.run(
+                        ["ffmpeg", "-y", "-i", str(dest), "-vf", "scale=320:-2",
+                         "-c:v", "libx264", "-preset", "fast", "-crf", "30",
+                         "-c:a", "aac", "-b:a", "96k", str(small)],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if _r.returncode == 0 and small.exists() and small.stat().st_size <= 8_000_000:
+                        b64vid = _b64.b64encode(small.read_bytes()).decode("ascii")
+                        prompt_text = (
+                            f"Analyze this AI-generated video frame. Engine: {reg_meta.get('engine','?')}. "
+                            f"Style: {reg_meta.get('style_id','?')}. Premise: {reg_meta.get('premise','?')[:100]}. "
+                            f"Respond with ONLY JSON: {{\"keep_decision\":\"keep|reject|reroll\","
+                            f"\"failure_class\":\"temporal|spatial|dialogue|style|artifact|visual_repetition|null\","
+                            f"\"severity\":\"critical|major|minor|null\",\"specific_notes\":\"...\","
+                            f"\"prompt_patches\":[{{\"find\":\"...\",\"replace\":\"...\"}}],\"score\":0-10,\"reasoning\":\"...\"}}"
+                        )
+                        payload = {
+                            "model": "Qwen-Ambassador/Qwen3.8-Max",
+                            "messages": [{"role": "user", "content": [
+                                {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64vid}"}},
+                                {"type": "text", "text": prompt_text},
+                            ]}],
+                            "max_tokens": 2048, "temperature": 0.3,
+                        }
+                        req = _urllib_req.Request(
+                            "https://api-inference.modelscope.ai/v1/chat/completions",
+                            data=json.dumps(payload).encode(),
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        )
+                        with _urllib_req.urlopen(req, timeout=300) as resp:
+                            mdata = json.loads(resp.read())
+                        content = mdata["choices"][0]["message"]["content"]
+                        import re as _re
+                        content = _re.sub(r'^```(?:json)?\s*', '', content.strip())
+                        content = _re.sub(r'\s*```$', '', content.strip())
+                        verdict = json.loads(content)
+                        # Store in qc_rejects
+                        import uuid as _uuid
+                        cid = _uuid.uuid4().hex[:16]
+                        patches_json = json.dumps(verdict.get("prompt_patches", [])) if verdict.get("prompt_patches") else None
+                        _conn.execute(
+                            """INSERT INTO qc_rejects (id, production_id, keep_decision, failure_class, severity,
+                               specific_notes, prompt_patches, qc_score) VALUES (?,?,?,?,?,?,?,?)""",
+                            (cid, production_id, verdict.get("keep_decision","keep"),
+                             verdict.get("failure_class"), verdict.get("severity"),
+                             verdict.get("specific_notes",""), patches_json, verdict.get("score")),
+                        )
+                        _conn.commit()
+                        print(f"[CURATOR] Verdict stored: {verdict.get('keep_decision')} score={verdict.get('score')}", flush=True)
+                        try:
+                            small.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    else:
+                        print(f"[CURATOR] Re-encode failed or too large, skipping inline curation", flush=True)
+                else:
+                    print(f"[CURATOR] No API key or file too small, skipping inline curation", flush=True)
+        except Exception as cur_exc:
+            print(f"[CURATOR] Inline curation failed (non-fatal): {cur_exc}", flush=True)
+            logger.warning(f"_finalize_media: inline curation failed: {cur_exc}")
+
         return str(dest)
     except Exception as exc:
         print(f"[STORE] Registration FAILED: {exc}", flush=True)
@@ -759,6 +885,10 @@ def _validate_prompt_coherence(
     dialogue (avoids double-annotating).
     """
     guide = _get_style_guide(style_id)
+    if not guide:
+        # Fallback: infer tone from style_id/franchise name keywords
+        # This prevents unknown styles from getting default hood-culture dialogue
+        guide = _infer_tone_from_ids(style_id)
     if not guide:
         return prompt
 
@@ -1442,6 +1572,143 @@ def _finish_job(job_id: str, status: str, outcome: str = "") -> None:
         print(f"[JOB] Failed to finish {job_id}: {e}", flush=True)
 
 
+_FAILURE_TYPES = (
+    "ssh_timeout", "wgp_crash", "ego_bridge_empty", "brief_generation_failed",
+    "qc_rejected", "modelscope_timeout", "other",
+)
+
+
+def _classify_failure(exc: Any, stage: str = "") -> str:
+    """Map an exception/string to a structured error_type.
+
+    Used so every production_cycle failure carries a machine-readable reason
+    (not a free-text sentence) for the optimizer to aggregate.
+    """
+    text = str(exc).lower() if exc else ""
+    if not text:
+        # An empty exception is a None-return fallback (e.g. empty bridge output).
+        if "h3" in stage or "wgp" in stage:
+            return "wgp_crash" if "bridge" not in stage else "ego_bridge_empty"
+        return "other"
+    if "brief" in stage:
+        return "brief_generation_failed"
+    if "timeout" in text or "timed out" in text or "deadline" in text:
+        if "modelscope" in stage or "flux" in stage or "qc" in stage:
+            return "modelscope_timeout"
+        if "ssh" in text or "h3" in stage:
+            return "ssh_timeout"
+        return "modelscope_timeout" if "http" in text else "ssh_timeout"
+    if "qc" in stage or "curat" in stage or "verdict" in text:
+        return "qc_rejected"
+    if "empty" in text or "no output" in text or "no session" in text or "none" in text:
+        if "bridge" in stage or "h3" in stage:
+            return "ego_bridge_empty"
+    if "wgp" in text or "crash" in text or "segfault" in text or "fault" in text:
+        return "wgp_crash"
+    if "http" in text or "api" in text or "connect" in text or "bridge" in text:
+        if "h3" in stage:
+            return "ego_bridge_empty" if "submit" in stage else "wgp_crash"
+        return "other"
+    return "other"
+
+
+def _compute_config_hash(pick: dict, brief: dict) -> str:
+    """sha256 over the config identity of a production (for attributing drift).
+
+    Hashes style_id + franchise + premise + dialogue_guide.tone + beat_map_type
+    so the optimizer can group productions by effective configuration.
+    """
+    guide = None
+    try:
+        style_id = pick.get("style_id", "")
+        guide = _get_style_guide(style_id) or _infer_tone_from_ids(style_id, pick.get("franchise", ""))
+    except Exception:  # noqa: BLE001
+        guide = None
+    beat_map_type = ""
+    try:
+        pp = brief.get("production_prompts", {}) if isinstance(brief, dict) else {}
+        h3 = pp.get("h3_multishot_json") or pp.get("h3_job_json") or {}
+        shots = h3.get("shots") or []
+        if shots:
+            beat_map_type = f"{len(shots)}-shot"
+    except Exception:  # noqa: BLE001
+        beat_map_type = ""
+    identity = "|".join([
+        str(pick.get("style_id", "")),
+        str(pick.get("franchise", "")),
+        str(pick.get("premise", "")),
+        str((guide or {}).get("tone", "") if guide else ""),
+        str(beat_map_type),
+    ])
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _build_failure_entry(
+    pick: dict,
+    reroll_count: int,
+    production_id: str,
+    error_type: str,
+    detail: str,
+    preview: Optional[dict] = None,
+) -> dict:
+    """Build a production entry dict with a structured failure for a failed cycle.
+
+    Includes config_hash (GAP3) and the structured failure block (GAP1):
+      {error_type, detail, timestamp, retry_count}
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "ts": time.time(),
+        "iso": now,
+        "production_id": production_id,
+        "style_id": pick.get("style_id", ""),
+        "franchise": pick.get("franchise", ""),
+        "premise": pick.get("premise", ""),
+        "niche": pick.get("niche", ""),
+        "h3_video": None,
+        "flux3_video": None,
+        "qc_status": "failed",
+        "failure_reason": detail,
+        "reroll_count": reroll_count,
+        "config_hash": _compute_config_hash(pick, {}),
+        "error_type": error_type if error_type in _FAILURE_TYPES else "other",
+        "structured_failure": {
+            "error_type": error_type if error_type in _FAILURE_TYPES else "other",
+            "detail": detail,
+            "timestamp": now,
+            "retry_count": int(reroll_count or 0),
+        },
+    }
+    if preview:
+        entry["preview"] = str(preview)[:500]
+    return entry
+
+
+def _persist_entry(entry: dict) -> str:
+    """Persist a production entry: primary store path, JSON log fallback."""
+    try:
+        return register_production(entry)
+    except Exception as exc:
+        logger.error(f"run_production_cycle: store register failed, falling back to log: {exc}")
+        _append_log(entry)
+        return entry.get("production_id", "")
+
+
+def _annotate_failure(entry: dict, error_type: str, detail: str, retry_count: int,
+                      stage: str = "") -> None:
+    """Set the structured failure block on an in-progress entry (in place)."""
+    entry["qc_status"] = "failed"
+    entry["failure_reason"] = detail
+    et = error_type if error_type in _FAILURE_TYPES else "other"
+    entry["error_type"] = et
+    entry["structured_failure"] = {
+        "error_type": et,
+        "detail": detail,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "retry_count": int(retry_count or 0),
+    }
+
+
 async def run_production_cycle(config: dict) -> dict:
     """Run one full production: pick -> brief -> H3 + Flux3 -> poll -> download -> log.
 
@@ -1467,6 +1734,22 @@ async def run_production_cycle(config: dict) -> dict:
 
     brief_resp = await _get_brief(pick)
     brief = brief_resp.get("brief") or {}
+    briefing_failure = None
+    if not brief or not brief.get("production_prompts"):
+        # Brief generation failed (VBL empty/error). Record a structured failure and
+        # stop the cycle — no point submitting empty prompts to H3/Flux.
+        briefing_failure = _classify_failure("brief generation empty", stage="brief")
+        _finish_job(brief_job, "failed", "brief generation empty")
+        entry = _build_failure_entry(
+            pick, reroll_count, production_id,
+            error_type=briefing_failure,
+            detail="VBL brief returned empty/no production_prompts",
+            preview=dict(brief_resp) if isinstance(brief_resp, dict) else None,
+        )
+        _persist_entry(entry)
+        return {"h3_video": None, "flux3_video": None, "brief": brief_resp,
+                "qc_status": "failed", "reroll_count": reroll_count,
+                "error_type": briefing_failure}
     out_dir = Path(config.get("output_dir", str(OUTPUT_DIR)))
     _finish_job(brief_job, "complete", json.dumps({"style": pick.get("style_id"), "franchise": pick.get("franchise")}))
 
@@ -1546,23 +1829,31 @@ async def run_production_cycle(config: dict) -> dict:
     h3_video = results[0] if not isinstance(results[0], Exception) else None
     flux3_video = results[1] if not isinstance(results[1], Exception) else None
     failure_reason = None
+    error_type = None
     if isinstance(results[0], Exception):
         failure_reason = str(results[0])
-        _finish_job(h3_job, "failed", str(results[0])[:500])
-        logger.error(f"run_production_cycle: H3 task raised: {results[0]}")
+        error_type = _classify_failure(results[0], stage="h3-submit")
+        _finish_job(h3_job, "failed", f"[{error_type}] {str(results[0])[:480]}")
+        logger.error(f"run_production_cycle: H3 task raised: error_type={error_type} {results[0]}")
     else:
         _finish_job(h3_job, "complete" if h3_video else "skipped", h3_video or "no output")
+        if not h3_video:
+            error_type = "ego_bridge_empty"
     if isinstance(results[1], Exception):
         failure_reason = str(results[1]) or failure_reason
-        _finish_job(flux_job, "failed", str(results[1])[:500])
-        logger.error(f"run_production_cycle: Flux3 task raised: {results[1]}")
+        error_type = _classify_failure(results[1], stage="flux3-submit") or error_type
+        _finish_job(flux_job, "failed", f"[{error_type}] {str(results[1])[:480]}")
+        logger.error(f"run_production_cycle: Flux3 task raised: error_type={error_type} {results[1]}")
     else:
         _finish_job(flux_job, "complete" if flux3_video else "skipped", flux3_video or "no output")
+        if not flux3_video and not error_type:
+            error_type = "modelscope_timeout"
 
-    qc_status = "ok" if (h3_video or flux3_video) else "failed"
+    qc_status = "failed" if not (h3_video or flux3_video) else "ok"
     entry = {
         "ts": time.time(),
         "iso": datetime.now(timezone.utc).isoformat(),
+        "production_id": production_id,
         "style_id": pick.get("style_id", ""),
         "franchise": pick.get("franchise", ""),
         "premise": pick.get("premise", ""),
@@ -1572,13 +1863,14 @@ async def run_production_cycle(config: dict) -> dict:
         "qc_status": qc_status,
         "failure_reason": failure_reason,
         "reroll_count": reroll_count,
+        "config_hash": _compute_config_hash(pick, brief),
     }
+    if error_type:
+        _annotate_failure(entry, error_type, failure_reason or "generation failed",
+                          reroll_count, stage="run")
+
     # Primary path: production store. Fallback to the JSON log if it fails.
-    try:
-        register_production(entry)
-    except Exception as exc:
-        logger.error(f"run_production_cycle: store register failed, falling back to log: {exc}")
-        _append_log(entry)
+    _persist_entry(entry)
 
     result = {"h3_video": h3_video, "flux3_video": flux3_video,
               "brief": brief_resp, "qc_status": qc_status, "reroll_count": reroll_count}
@@ -1587,24 +1879,51 @@ async def run_production_cycle(config: dict) -> dict:
     if reroll_count >= 1:
         return result
 
+    # GAP 6: Check qc_rejects for curator verdict with prompt_patches
+    curator_improvements = []
+    try:
+        from database import get_connection as _gc
+        _conn = _gc()
+        verdict_row = _conn.execute(
+            "SELECT prompt_patches, keep_decision, specific_notes FROM qc_rejects WHERE production_id = ? ORDER BY reviewed_at DESC LIMIT 1",
+            (production_id,),
+        ).fetchone()
+        if verdict_row and verdict_row["keep_decision"] == "reroll" and verdict_row["prompt_patches"]:
+            patches = json.loads(verdict_row["prompt_patches"])
+            if isinstance(patches, list):
+                # Convert {find, replace} patches to improvement strings
+                for p in patches:
+                    if isinstance(p, dict) and p.get("replace"):
+                        curator_improvements.append(p["replace"])
+                if curator_improvements:
+                    print(f"[REROLL] Curator verdict triggered reroll: {verdict_row['specific_notes'][:100]}", flush=True)
+                    logger.info(f"[REROLL] Curator verdict triggered reroll for {production_id}")
+    except Exception as e:
+        logger.warning(f"run_production_cycle: curator verdict check failed: {e}")
+
+    # Merge curator improvements with ModelScope improvements
     improvements = await _collect_reroll_improvements([h3_video, flux3_video])
-    if improvements:
-        improved = _build_improved_premise(pick.get("premise", ""), improvements)
-        print(f"[REROLL] Attempting reroll with improved prompt: {improvements}", flush=True)
-        logger.info(f"[REROLL] Attempting reroll with improved prompt: {improvements}")
-        _log_job("factory", "reroll", "running", session_id, production_id, outcome=json.dumps(improvements)[:500], reroll_count=reroll_count, parent_job_id=parent_job_id)
+    all_improvements = list(dict.fromkeys(curator_improvements + (improvements or [])))  # dedup preserving order
+
+    if all_improvements:
+        improved = _build_improved_premise(pick.get("premise", ""), all_improvements)
+        reroll_source = "curator+modelscope" if (curator_improvements and improvements) else ("curator" if curator_improvements else "modelscope")
+        print(f"[REROLL] Attempting reroll ({reroll_source}) with improved prompt: {all_improvements}", flush=True)
+        logger.info(f"[REROLL] Attempting reroll ({reroll_source}) with improved prompt: {all_improvements}")
+        _log_job("factory", "reroll", "running", session_id, production_id, outcome=json.dumps(all_improvements)[:500], reroll_count=reroll_count, parent_job_id=parent_job_id)
         reroll_config = dict(config)
         reroll_config.update({
             "premise": improved,
             "reroll_count": 1,
-            "prompt_improvements": improvements,
+            "prompt_improvements": all_improvements,
             "production_id": production_id,
             "session_id": session_id,
             "parent_job_id": brief_job,
         })
         reroll_result = await run_production_cycle(reroll_config)
         reroll_result["rerolled_from"] = pick.get("premise", "")
-        reroll_result["reroll_improvements"] = improvements
+        reroll_result["reroll_improvements"] = all_improvements
+        reroll_result["reroll_source"] = reroll_source
         return reroll_result
 
     return result
