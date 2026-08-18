@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -262,6 +263,7 @@ async def _get_brief(pick: dict) -> dict:
         "style_id": pick["style_id"],
         "max_rounds": 3,
     }
+    print(f"[BRIEF] Sending goal={json.dumps(payload['goal'])[:120]!r} to {VBL_BRIEF_URL}", flush=True)
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(VBL_BRIEF_URL, json=payload)
         r.raise_for_status()
@@ -714,6 +716,95 @@ async def _collect_reroll_improvements(video_paths: list) -> list:
                 seen.add(key)
                 combined.append(text)
     return combined
+
+
+def _apply_reroll_to_flux3(brief: dict, improvements: list) -> dict:
+    """Post-process the flux3 /t2v prompt for a reroll so it ACTUALLY changes.
+
+    VBL may return a cached/prompt with stale quoted dialogue ("Y'all see what
+    just happened?") even when a new premise/goal is sent. We can't change VBL
+    from sgos-backend, so:
+      1. Strip quoted dialogue + voice/speaker directions from the flux3 prompt.
+      2. Append the prompt_improvements as visual description additions.
+    Returns a NEW brief (does not mutate the caller's dict) whose flux3 prompt
+    is guaranteed to differ from the original.
+    """
+    pp = brief.get("production_prompts", {})
+    flux3 = pp.get("flux3", "")
+    if not flux3 or not improvements:
+        return brief
+    orig = flux3
+
+    # Strip quoted dialogue (single or double quotes) and voice/speaker phrasing.
+    cleaned = re.sub(r'"[^"]*"|\'[^\']*\'', "", flux3)
+    cleaned = re.sub(
+        r"\b(says|saying|said|speaks|speech|say|voice(?:-?over)?|dialogue|off(?:-)?screen|v\.o\.)\b[^,.;]*",
+        "", cleaned, flags=re.IGNORECASE,
+    )
+    # Collapse leftover artifacts: stray commas (', ,'), empty segments.
+    cleaned = re.sub(r"\s*,+\s*,+\s*", ", ", cleaned)
+    cleaned = re.sub(r"\s*,\s*$", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = cleaned.rstrip(", ").strip()
+    if cleaned:
+        flux3 = cleaned
+
+    # Append improvements as visual additions (before the /t2v params).
+    additions = ", ".join(i.rstrip(".") for i in improvements if str(i).strip())
+    if additions:
+        if " duration:" in flux3:
+            head, _, tail = flux3.partition(" duration:")
+            flux3 = f"{head.rstrip(',')}, {additions}. duration:{tail}"
+        else:
+            flux3 = f"{flux3.rstrip()}. {additions}."
+
+    if flux3 == orig:
+        # Dialogue-strip didn't change anything; force a distinguishing suffix.
+        flux3 = f"{flux3.rstrip()}. Enhanced reroll: {', '.join(improvements)}."
+
+    n_dialogue = len(re.findall(r'"[^"]*"|\'[^\']*\'', orig))
+    print(f"[REROLL_FIX] Cleaned flux3 prompt for reroll: removed {n_dialogue} dialogue strings; now differs from original", flush=True)
+
+    new_pp = dict(pp)
+    new_pp["flux3"] = flux3
+    new_brief = dict(brief)
+    new_brief["production_prompts"] = new_pp
+    return new_brief
+
+
+def _apply_reroll_to_h3(brief: dict, improvements: list) -> dict:
+    """Ensure the H3 prompts reflect the reroll improvements.
+
+    Appends the improvements to each shot's prompt (h3_multishot_json.shots[]),
+    and to the single-shot h3_job_json.prompt, so the H3 output also changes.
+    """
+    pp = dict(brief.get("production_prompts", {}))
+    add = ", ".join(i.rstrip(".") for i in improvements if str(i).strip())
+    if not add:
+        return brief
+
+    ms = pp.get("h3_multishot_json")
+    if isinstance(ms, dict) and isinstance(ms.get("shots"), list):
+        new_shots = []
+        for shot in ms["shots"]:
+            s = dict(shot)
+            base = s.get("prompt", "")
+            s["prompt"] = f"{base}, {add}" if base else add
+            new_shots.append(s)
+        ms2 = dict(ms)
+        ms2["shots"] = new_shots
+        pp["h3_multishot_json"] = ms2
+
+    job = pp.get("h3_job_json")
+    if isinstance(job, dict):
+        base = job.get("prompt", "")
+        job2 = dict(job)
+        job2["prompt"] = f"{base}, {add}" if base else add
+        pp["h3_job_json"] = job2
+
+    new_brief = dict(brief)
+    new_brief["production_prompts"] = pp
+    return new_brief
 
 
 def _extract_video_meta(path: Path) -> dict:
@@ -1216,6 +1307,17 @@ async def run_production_cycle(config: dict) -> dict:
     # Pre-generation prompt validation (warn only, never modify)
     _validate_prompts(brief)
 
+    # On a reroll, VBL may return the SAME flux3 prompt (stale dialogue) despite
+    # the improved premise. Post-process the brief so the generated prompt
+    # actually changes from the original (see option-2 root-cause fix).
+    if reroll_count > 0:
+        improvements = config.get("prompt_improvements") or []
+        if improvements:
+            brief = _apply_reroll_to_flux3(brief, improvements)
+            brief = _apply_reroll_to_h3(brief, improvements)
+            brief_resp = dict(brief_resp)
+            brief_resp["brief"] = brief
+
     # Dedup guard: warn (but don't block) if this exact production happened recently.
     try:
         dup = await asyncio.to_thread(
@@ -1282,7 +1384,11 @@ async def run_production_cycle(config: dict) -> dict:
         print(f"[REROLL] Attempting reroll with improved prompt: {improvements}", flush=True)
         logger.info(f"[REROLL] Attempting reroll with improved prompt: {improvements}")
         reroll_config = dict(config)
-        reroll_config.update({"premise": improved, "reroll_count": 1})
+        reroll_config.update({
+            "premise": improved,
+            "reroll_count": 1,
+            "prompt_improvements": improvements,
+        })
         reroll_result = await run_production_cycle(reroll_config)
         reroll_result["rerolled_from"] = pick.get("premise", "")
         reroll_result["reroll_improvements"] = improvements
