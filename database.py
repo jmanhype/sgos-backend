@@ -152,6 +152,31 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_prod_engine_hash ON productions(engine, file_hash) WHERE file_hash IS NOT NULL;
     """)
 
+    # Factory job tracking table — every stage of every production attempt
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS factory_jobs (
+            id TEXT PRIMARY KEY,
+            production_id TEXT,
+            session_id TEXT,
+            engine TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            started_at TIMESTAMP,
+            created_at TIMESTAMP,  -- alias populated same as started_at for metrics compat
+            finished_at TIMESTAMP,
+            duration_s REAL,
+            render_duration_s REAL,  -- populated for h3/flux3 stages (GPU/render time)
+            outcome TEXT,
+            reroll_count INTEGER DEFAULT 0,
+            parent_job_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fj_session ON factory_jobs(session_id);
+        CREATE INDEX IF NOT EXISTS idx_fj_engine ON factory_jobs(engine);
+        CREATE INDEX IF NOT EXISTS idx_fj_status ON factory_jobs(status);
+        CREATE INDEX IF NOT EXISTS idx_fj_stage ON factory_jobs(stage);
+        CREATE INDEX IF NOT EXISTS idx_fj_started ON factory_jobs(started_at DESC);
+    """)
+
     # Migrate: add QC columns if missing (safe for existing tables)
     try:
         cols = {r[1] for r in c.execute("PRAGMA table_info(productions)").fetchall()}
@@ -161,6 +186,16 @@ def init_db():
             c.execute("ALTER TABLE productions ADD COLUMN qc_notes TEXT")
     except Exception:
         pass  # Table may not exist yet; columns will be created with next init
+
+    # Migrate: add factory_jobs columns if missing
+    try:
+        fj_cols = {r[1] for r in c.execute("PRAGMA table_info(factory_jobs)").fetchall()}
+        if "created_at" not in fj_cols:
+            c.execute("ALTER TABLE factory_jobs ADD COLUMN created_at TIMESTAMP")
+        if "render_duration_s" not in fj_cols:
+            c.execute("ALTER TABLE factory_jobs ADD COLUMN render_duration_s REAL")
+    except Exception:
+        pass
 
     # Create FTS5 virtual table if not exists
     try:

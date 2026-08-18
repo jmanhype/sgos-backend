@@ -5,10 +5,12 @@ import threading
 import uuid
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from database import get_connection
 from lib.content_factory import run_grind_session
+from lib.factory_metrics import compute_metrics
 
 router = APIRouter(prefix="/v1/factory", tags=["factory"])
 
@@ -76,3 +78,13 @@ async def factory_status(session_id: str):
     if prog is None:
         raise HTTPException(status_code=404, detail=f"Unknown session {session_id}")
     return prog
+
+
+@router.get("/metrics")
+async def factory_metrics(days: int = Query(7, ge=1, le=365, description="Lookback window in days")):
+    """Return computed factory quality metrics over the last `days` days."""
+    try:
+        conn = get_connection()
+        return compute_metrics(conn, days=days)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"metrics computation failed: {exc}")

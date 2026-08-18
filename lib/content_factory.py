@@ -1271,6 +1271,63 @@ def _validate_prompts(brief: dict) -> dict:
     return brief
 
 
+# ─── Factory Job Tracking ─────────────────────────────────────────────────────
+
+def _log_job(
+    engine: str, stage: str, status: str,
+    session_id: str = "", production_id: str = "",
+    outcome: str = "", parent_job_id: str = "",
+    reroll_count: int = 0, started_at: str = "",
+) -> str:
+    """Insert or update a factory_jobs row. Returns the job id."""
+    import uuid as _uuid
+    from database import get_connection
+    job_id = _uuid.uuid4().hex[:16]
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO factory_jobs
+               (id, production_id, session_id, engine, stage, status,
+                started_at, created_at, finished_at, duration_s, outcome, reroll_count, parent_job_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, production_id, session_id, engine, stage, status,
+             started_at or now, started_at or now,
+             now if status in ("complete", "failed", "skipped") else None,
+             None, outcome, reroll_count, parent_job_id),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[JOB] Failed to log {engine}/{stage}: {e}", flush=True)
+    return job_id
+
+
+def _finish_job(job_id: str, status: str, outcome: str = "") -> None:
+    """Mark a factory_jobs row as complete/failed with duration."""
+    from database import get_connection
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn = get_connection()
+        # Calculate duration from started_at
+        row = conn.execute("SELECT started_at FROM factory_jobs WHERE id = ?", (job_id,)).fetchone()
+        duration = None
+        if row and row["started_at"]:
+            try:
+                from datetime import datetime as _dt
+                sa = _dt.fromisoformat(row["started_at"])
+                fa = _dt.fromisoformat(now)
+                duration = round((fa - sa).total_seconds(), 1)
+            except Exception:
+                pass
+        conn.execute(
+            "UPDATE factory_jobs SET status = ?, finished_at = ?, duration_s = ?, outcome = ? WHERE id = ?",
+            (status, now, duration, outcome, job_id),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[JOB] Failed to finish {job_id}: {e}", flush=True)
+
+
 async def run_production_cycle(config: dict) -> dict:
     """Run one full production: pick -> brief -> H3 + Flux3 -> poll -> download -> log.
 
@@ -1281,7 +1338,13 @@ async def run_production_cycle(config: dict) -> dict:
     re-runs once with an improved premise (capped at 1 reroll per production).
     """
     reroll_count = int(config.get("reroll_count", 0) or 0)
-    print(f"[FACTORY] run_production_cycle starting with config keys: {list(config.keys())}", flush=True)
+    session_id = config.get("session_id", "")
+    production_id = config.get("production_id") or uuid.uuid4().hex[:16]
+    parent_job_id = config.get("parent_job_id", "")
+    print(f"[FACTORY] run_production_cycle starting (prod={production_id}, reroll={reroll_count})", flush=True)
+
+    # Stage: brief
+    brief_job = _log_job("factory", "brief", "running", session_id, production_id, reroll_count=reroll_count, parent_job_id=parent_job_id)
     pick = (
         await asyncio.to_thread(pick_next_production) if not config.get("style_id")
         else dict(config)
@@ -1291,6 +1354,7 @@ async def run_production_cycle(config: dict) -> dict:
     brief_resp = await _get_brief(pick)
     brief = brief_resp.get("brief") or {}
     out_dir = Path(config.get("output_dir", str(OUTPUT_DIR)))
+    _finish_job(brief_job, "complete", json.dumps({"style": pick.get("style_id"), "franchise": pick.get("franchise")}))
 
     # Pre-generation prompt validation (warn only, never modify)
     _validate_prompts(brief)
@@ -1324,6 +1388,12 @@ async def run_production_cycle(config: dict) -> dict:
     # doesn't cancel the other). Pass the pick metadata for registration.
     provenance = {k: pick.get(k, "") for k in ("style_id", "franchise", "premise", "niche")}
     provenance["reroll_count"] = reroll_count
+    provenance["production_id"] = production_id
+    provenance["session_id"] = session_id
+
+    h3_job = _log_job("h3", "submit", "running", session_id, production_id, reroll_count=reroll_count, parent_job_id=parent_job_id)
+    flux_job = _log_job("flux3", "submit", "running", session_id, production_id, reroll_count=reroll_count, parent_job_id=parent_job_id)
+
     h3_task = asyncio.create_task(_submit_and_poll_h3(brief, out_dir, provenance))
     flux_task = asyncio.create_task(_send_and_poll_flux(brief, out_dir, provenance))
 
@@ -1333,10 +1403,16 @@ async def run_production_cycle(config: dict) -> dict:
     failure_reason = None
     if isinstance(results[0], Exception):
         failure_reason = str(results[0])
+        _finish_job(h3_job, "failed", str(results[0])[:500])
         logger.error(f"run_production_cycle: H3 task raised: {results[0]}")
+    else:
+        _finish_job(h3_job, "complete" if h3_video else "skipped", h3_video or "no output")
     if isinstance(results[1], Exception):
         failure_reason = str(results[1]) or failure_reason
+        _finish_job(flux_job, "failed", str(results[1])[:500])
         logger.error(f"run_production_cycle: Flux3 task raised: {results[1]}")
+    else:
+        _finish_job(flux_job, "complete" if flux3_video else "skipped", flux3_video or "no output")
 
     qc_status = "ok" if (h3_video or flux3_video) else "failed"
     entry = {
@@ -1371,11 +1447,15 @@ async def run_production_cycle(config: dict) -> dict:
         improved = _build_improved_premise(pick.get("premise", ""), improvements)
         print(f"[REROLL] Attempting reroll with improved prompt: {improvements}", flush=True)
         logger.info(f"[REROLL] Attempting reroll with improved prompt: {improvements}")
+        _log_job("factory", "reroll", "running", session_id, production_id, outcome=json.dumps(improvements)[:500], reroll_count=reroll_count, parent_job_id=parent_job_id)
         reroll_config = dict(config)
         reroll_config.update({
             "premise": improved,
             "reroll_count": 1,
             "prompt_improvements": improvements,
+            "production_id": production_id,
+            "session_id": session_id,
+            "parent_job_id": brief_job,
         })
         reroll_result = await run_production_cycle(reroll_config)
         reroll_result["rerolled_from"] = pick.get("premise", "")
