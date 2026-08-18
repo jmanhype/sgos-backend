@@ -313,17 +313,19 @@ async def curate_production(production_id: str):
                        "specific_notes": "Local fallback: failed technical QC", "prompt_patches": [],
                        "score": score, "reasoning": "No VLM available; low score indicates rejection."}
     else:
-        # Encode first frame for analysis
+        # Encode frames for analysis (up to 4 frames)
         try:
-            b64_frame = base64.b64encode(frame_files[0].read_bytes()).decode("ascii")
+            content_parts = []
+            for ff in frame_files[:4]:
+                img_b64 = base64.b64encode(ff.read_bytes()).decode("ascii")
+                content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}})
+            content_parts.append({"type": "text", "text": analysis_prompt})
+            
             payload = {
-                "model": "Qwen-Ambassador/Qwen3.8-Max",
+                "model": "Qwen/Qwen3-VL-235B-A22B-Instruct",
                 "messages": [{
                     "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_frame}"}},
-                        {"type": "text", "text": analysis_prompt},
-                    ],
+                    "content": content_parts,
                 }],
                 "max_tokens": 2048,
                 "temperature": 0.3,

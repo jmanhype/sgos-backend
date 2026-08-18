@@ -815,35 +815,42 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
             ).fetchone()
             if not already_curated:
                 print(f"[CURATOR] Triggering inline curation for {production_id}", flush=True)
-                # Inline curator: re-encode + ModelScope vision analysis
+                # Inline curator: extract frames + ModelScope vision analysis
                 import subprocess as _sp
                 import base64 as _b64
                 import urllib.request as _urllib_req
+                import tempfile
+                import shutil
                 api_key = os.environ.get("MODELSCOPE_API_KEY", "")
                 if api_key and dest.exists() and dest.stat().st_size > 1_000_000:
-                    small = dest.parent / f".curator_{dest.stem}.mp4"
+                    # Extract 4 frames from video
+                    frames_dir = Path(tempfile.mkdtemp(prefix="curator_frames_"))
                     _r = _sp.run(
-                        ["ffmpeg", "-y", "-i", str(dest), "-vf", "scale=320:-2",
-                         "-c:v", "libx264", "-preset", "fast", "-crf", "30",
-                         "-c:a", "aac", "-b:a", "96k", str(small)],
-                        capture_output=True, text=True, timeout=60,
+                        ["ffmpeg", "-y", "-i", str(dest),
+                         "-vf", "select='not(mod(n\\,30))'", "-vframes", "4",
+                         "-q:v", "5", str(frames_dir / "frame_%02d.jpg")],
+                        capture_output=True, text=True, timeout=30,
                     )
-                    if _r.returncode == 0 and small.exists() and small.stat().st_size <= 8_000_000:
-                        b64vid = _b64.b64encode(small.read_bytes()).decode("ascii")
+                    frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+                    if frame_files:
+                        # Encode frames as image sequence
+                        content_parts = []
+                        for ff in frame_files[:4]:
+                            img_b64 = _b64.b64encode(ff.read_bytes()).decode("ascii")
+                            content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+                        
                         prompt_text = (
-                            f"Analyze this AI-generated video frame. Engine: {reg_meta.get('engine','?')}. "
+                            f"These are 4 frames from an AI-generated video. Engine: {reg_meta.get('engine','?')}. "
                             f"Style: {reg_meta.get('style_id','?')}. Premise: {reg_meta.get('premise','?')[:100]}. "
                             f"Respond with ONLY JSON: {{\"keep_decision\":\"keep|reject|reroll\","
                             f"\"failure_class\":\"temporal|spatial|dialogue|style|artifact|visual_repetition|null\","
                             f"\"severity\":\"critical|major|minor|null\",\"specific_notes\":\"...\","
                             f"\"prompt_patches\":[{{\"find\":\"...\",\"replace\":\"...\"}}],\"score\":0-10,\"reasoning\":\"...\"}}"
                         )
+                        content_parts.append({"type": "text", "text": prompt_text})
                         payload = {
-                            "model": "Qwen-Ambassador/Qwen3.8-Max",
-                            "messages": [{"role": "user", "content": [
-                                {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64vid}"}},
-                                {"type": "text", "text": prompt_text},
-                            ]}],
+                            "model": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+                            "messages": [{"role": "user", "content": content_parts}],
                             "max_tokens": 2048, "temperature": 0.3,
                         }
                         req = _urllib_req.Request(
@@ -857,6 +864,7 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
                         import re as _re
                         content = _re.sub(r'^```(?:json)?\s*', '', content.strip())
                         content = _re.sub(r'\s*```$', '', content.strip())
+                        # Parse and store verdict BEFORE cleanup
                         verdict = json.loads(content)
                         # Store in qc_rejects
                         import uuid as _uuid
@@ -871,12 +879,13 @@ async def _finalize_media(dest: Path, meta: dict) -> Optional[str]:
                         )
                         _conn.commit()
                         print(f"[CURATOR] Verdict stored: {verdict.get('keep_decision')} score={verdict.get('score')}", flush=True)
-                        try:
-                            small.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                    # Clean up frames
+                    try:
+                        shutil.rmtree(frames_dir, ignore_errors=True)
+                    except OSError:
+                        pass
                     else:
-                        print(f"[CURATOR] Re-encode failed or too large, skipping inline curation", flush=True)
+                        print(f"[CURATOR] No frames extracted, skipping inline curation", flush=True)
                 else:
                     print(f"[CURATOR] No API key or file too small, skipping inline curation", flush=True)
         except Exception as cur_exc:
@@ -1246,65 +1255,55 @@ def _qc_local_check(video_path: Path, vid_meta: dict) -> dict:
 
 
 async def _qc_video_modelscope(video_path: Path, metadata: dict) -> Optional[dict]:
-    """QC a video via ModelScope Qwen3.8-Max vision API.
+    """QC a video via ModelScope Qwen3-VL vision API.
 
-    Re-encodes to ≤8MB at 320p, base64 encodes, sends structured QC prompt.
+    Extracts 4 frames, sends as image sequence (video input not supported).
     Returns parsed {motion_quality, temporal_coherence, style_adherence,
     artifacts, overall_watchability, summary} or None on any failure.
     Never raises — all errors are logged and return None.
     """
     import base64
     import subprocess as _sp
+    import tempfile
 
     api_key = os.environ.get("MODELSCOPE_API_KEY", "")
     if not api_key:
         print("[QC-MS] MODELSCOPE_API_KEY not set — skipping ModelScope QC", flush=True)
         return None
 
-    # Step 1: Re-encode to ≤8MB at 320p
-    small_path = video_path.parent / f".qc_{video_path.stem}_small.mp4"
-    print(f"[QC-MS] Re-encoding {video_path.name} to 320p for ModelScope...", flush=True)
+    # Step 1: Extract 4 frames evenly spaced
+    print(f"[QC-MS] Extracting frames from {video_path.name}...", flush=True)
+    frames_dir = Path(tempfile.mkdtemp(prefix="qc_frames_"))
     try:
         r = _sp.run(
             ["ffmpeg", "-y", "-i", str(video_path),
-             "-vf", "scale=320:-2", "-c:v", "libx264", "-preset", "fast",
-             "-crf", "30", "-c:a", "aac", "-b:a", "96k", str(small_path)],
-            capture_output=True, text=True, timeout=60,
+             "-vf", "select='not(mod(n\\,30))'", "-vframes", "4",
+             "-q:v", "5", str(frames_dir / "frame_%02d.jpg")],
+            capture_output=True, text=True, timeout=30,
         )
-        if r.returncode != 0 or not small_path.exists():
-            print(f"[QC-MS] Re-encode failed: {r.stderr[:200]}", flush=True)
+        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+        if not frame_files:
+            print(f"[QC-MS] No frames extracted", flush=True)
             return None
-        small_size = small_path.stat().st_size
-        print(f"[QC-MS] Re-encoded: {small_size:,} bytes ({small_size/1024/1024:.1f}MB)", flush=True)
-        if small_size > 8_000_000:
-            print(f"[QC-MS] Still too large ({small_size:,}b), trying CRF 35...", flush=True)
-            r = _sp.run(
-                ["ffmpeg", "-y", "-i", str(video_path),
-                 "-vf", "scale=240:-2", "-c:v", "libx264", "-preset", "fast",
-                 "-crf", "35", "-c:a", "aac", "-b:a", "64k", str(small_path)],
-                capture_output=True, text=True, timeout=60,
-            )
-            if r.returncode != 0 or not small_path.exists() or small_path.stat().st_size > 8_000_000:
-                print(f"[QC-MS] Could not reduce to ≤8MB — skipping ModelScope QC", flush=True)
-                return None
-            small_size = small_path.stat().st_size
-            print(f"[QC-MS] Second pass: {small_size:,} bytes", flush=True)
+        print(f"[QC-MS] Extracted {len(frame_files)} frames", flush=True)
     except Exception as e:
-        print(f"[QC-MS] Re-encode error: {e}", flush=True)
+        print(f"[QC-MS] Frame extraction error: {e}", flush=True)
         return None
 
-    # Step 2: Base64 encode
+    # Step 2: Base64 encode frames
     try:
-        with open(small_path, "rb") as f:
-            b64_video = base64.b64encode(f.read()).decode("ascii")
-        print(f"[QC-MS] Base64 encoded: {len(b64_video):,} chars", flush=True)
+        content_parts = []
+        for ff in frame_files[:4]:
+            img_b64 = base64.b64encode(ff.read_bytes()).decode("ascii")
+            content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
     except Exception as e:
-        print(f"[QC-MS] Base64 encode error: {e}", flush=True)
+        print(f"[QC-MS] Frame encoding error: {e}", flush=True)
         return None
     finally:
-        # Clean up temp file
+        # Clean up temp frames
         try:
-            small_path.unlink(missing_ok=True)
+            import shutil
+            shutil.rmtree(frames_dir, ignore_errors=True)
         except OSError:
             pass
 
@@ -1313,7 +1312,7 @@ async def _qc_video_modelscope(video_path: Path, metadata: dict) -> Optional[dic
     style = metadata.get("style_id", "unknown")
     engine = metadata.get("engine", "unknown")
     qc_prompt = (
-        f"You are a professional video quality reviewer. Analyze this AI-generated video.\n\n"
+        f"You are a professional video quality reviewer. These are 4 frames extracted from an AI-generated video.\n\n"
         f"INTENDED CONTENT:\n"
         f"- Engine: {engine}\n"
         f"- Style: {style}\n"
@@ -1331,21 +1330,19 @@ async def _qc_video_modelscope(video_path: Path, metadata: dict) -> Optional[dic
         f'}}'
     )
 
-    # Step 4: Call ModelScope API
+    # Step 4: Call ModelScope API with image sequence
+    content_parts.append({"type": "text", "text": qc_prompt})
     payload = {
-        "model": "Qwen-Ambassador/Qwen3.8-Max",
+        "model": "Qwen/Qwen3-VL-235B-A22B-Instruct",
         "messages": [{
             "role": "user",
-            "content": [
-                {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64_video}"}},
-                {"type": "text", "text": qc_prompt},
-            ],
+            "content": content_parts,
         }],
         "max_tokens": 2048,
         "temperature": 0.3,
     }
 
-    print(f"[QC-MS] Sending to ModelScope Qwen3.8-Max...", flush=True)
+    print(f"[QC-MS] Sending to ModelScope Qwen3-VL-235B...", flush=True)
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(

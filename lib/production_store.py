@@ -153,8 +153,8 @@ def register_production(metadata: dict) -> str:
             """INSERT INTO productions (
                 id, style_id, franchise, premise, niche, engine,
                 qc_status, failure_reason, seed, duration_s, resolution,
-                file_path, file_size, file_hash, prompt, render_duration_s, generated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                file_path, file_size, file_hash, prompt, render_duration_s, config_hash, generated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 prod_id,
                 metadata.get("style_id", ""),
@@ -172,6 +172,7 @@ def register_production(metadata: dict) -> str:
                 metadata.get("file_hash"),
                 metadata.get("prompt"),
                 metadata.get("render_duration_s"),
+                metadata.get("config_hash"),
                 metadata.get("generated_at", now),
             ),
         )
