@@ -20,6 +20,11 @@ services:
       # SSH keys + known_hosts for the H3 pipeline — read-only, secrets stay out
       # of the image. Requires ~/.ssh/known_hosts to contain the 3090 host key.
       - "${HOME}/.ssh:/root/.ssh:ro"
+      # VBL data (visual register, dialogue corpus) and Lost Futures index
+      - "${HOME}/viral-bench-local/data:/app/vbl-data:ro"
+      - "${HOME}/gist-archive/gists-film-aesthetics/lost-futures:/app/lost-futures:ro"
+      # Production storage (videos, references, metadata)
+      - "${HOME}/sgos-productions:/root/sgos-productions"
     environment:
       # ── H3 pipeline: talk to the 3090 box ───────────────
       H3_GPU_HOST: ${H3_GPU_HOST:-192.168.1.143}
@@ -27,6 +32,16 @@ services:
       H3_REMOTE_HOME: ${H3_REMOTE_HOME:-/home/straughter/Wan2GP}
       # ── Optional app auth (leave empty for no auth, like dev) ──
       SGOS_API_KEY: ${SGOS_API_KEY:-}
+      SGOS_HOST: "127.0.0.1"
+      # Point to mounted data paths inside container
+      VISUAL_REGISTER: "/app/vbl-data/visual_register.json"
+      LOST_FUTURES_INDEX: "/app/lost-futures"
+      # Host services accessible from container via host.docker.internal
+      VBL_BRIEF_URL: "http://host.docker.internal:8002/v1/agent/brief"
+      EGO_BRIDGE_URL: "http://host.docker.internal:8040"
+      H3_BRIDGE_URL: "http://host.docker.internal:8041"
+      # Host path for bridge downloads (bridges run on host, need host paths)
+      HOST_PRODUCTIONS_ROOT: "/Users/speed/sgos-productions"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8420/health || exit 1"]
       interval: 30s
